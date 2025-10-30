@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # Example:
-#   python3 experiments_ud.py --password ItayBachar88 --setup_timeout 20 --timeout 10 --edges $(seq 100 100 300)
-
+#   python3 experiments_UD.py --password ItayBachar88 --setup_timeout 20 --timeout 10 --edges $(seq 20 20 300)
+#   python3 experiments_UD.py --password ItayBachar88 --setup_timeout 20 --timeout 10 --edges $(seq 20 20 300) --debug 10
 import argparse
 import csv
 import json
 import sys
 import time
 import multiprocessing
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from pathlib import Path
+from collections import Counter
+
 from neo4j import GraphDatabase
 from neo4j.exceptions import Neo4jError, AuthError
 
@@ -18,7 +20,6 @@ from neo4j.exceptions import Neo4jError, AuthError
 # ----------------------------
 RESET = "MATCH (n) DETACH DELETE n"
 
-# One statement per run (Bolt rule)
 SCHEMA_STMTS = [
     "CREATE CONSTRAINT account_id IF NOT EXISTS "
     "FOR (a:Account) REQUIRE a.id IS UNIQUE",
@@ -68,7 +69,7 @@ MATCH (su:StageUD {accId: u.id, phase:'U'})
 WHERE su.level < j
 MERGE (sv:StageUD {accId: v.id, level: j, phase:'U'})
 MERGE (su)-[le:TRANSFER_LIFT_UD {amount: j}]->(sv)
-  ON CREATE SET le.ts = ts
+  ON CREATE SET le.ts = ts, le.baseRelEid = elementId(e)
 """
 
 # U -> Peak  (choose peak immediately after an increasing step)
@@ -79,7 +80,7 @@ MATCH (su:StageUD {accId: u.id, phase:'U'})
 WHERE su.level < j
 MERGE (sv:StageUD {accId: v.id, level: j, phase:'Peak'})
 MERGE (su)-[le:TRANSFER_LIFT_UD {amount: j}]->(sv)
-  ON CREATE SET le.ts = ts
+  ON CREATE SET le.ts = ts, le.baseRelEid = elementId(e)
 """
 
 # Peak -> D  (first strictly decreasing step)
@@ -90,7 +91,7 @@ MATCH (su:StageUD {accId: u.id, phase:'Peak'})
 WHERE j < su.level
 MERGE (sv:StageUD {accId: v.id, level: j, phase:'D'})
 MERGE (su)-[le:TRANSFER_LIFT_UD {amount: j}]->(sv)
-  ON CREATE SET le.ts = ts
+  ON CREATE SET le.ts = ts, le.baseRelEid = elementId(e)
 """
 
 # D -> D  (continue strictly decreasing)
@@ -101,36 +102,79 @@ MATCH (su:StageUD {accId: u.id, phase:'D'})
 WHERE j < su.level
 MERGE (sv:StageUD {accId: v.id, level: j, phase:'D'})
 MERGE (su)-[le:TRANSFER_LIFT_UD {amount: j}]->(sv)
-  ON CREATE SET le.ts = ts
+  ON CREATE SET le.ts = ts, le.baseRelEid = elementId(e)
 """
 
-# -------- Baseline & lifted counts (avoid streaming) --------
-# Baseline UD: amounts first strictly increase, then strictly decrease (both parts non-empty)
+def build_ud(session, build_timeout: Optional[float] = None):
+    run_write(session, BUILD_STAGEUD_NODES, timeout_sec=build_timeout)
+    run_write(session, BUILD_STAGEUD_EDGES_UU, timeout_sec=build_timeout)
+    run_write(session, BUILD_STAGEUD_EDGES_UP, timeout_sec=build_timeout)
+    run_write(session, BUILD_STAGEUD_EDGES_PD, timeout_sec=build_timeout)
+    run_write(session, BUILD_STAGEUD_EDGES_DD, timeout_sec=build_timeout)
+
+# -------- Baseline & lifted counts (min 2 edges; count all peak choices) --------
 BASELINE_UD_COUNT = """
 CALL () {
   MATCH p = (s:Account)-[:TRANSFER*]->(t:Account)
   WITH [r IN relationships(p) | r.amount] AS a
-  WHERE size(a) >= 3
-    AND ANY(k IN range(1, size(a)-2) WHERE
-      ALL(i IN range(1, k) WHERE a[i-1] < a[i]) AND
-      ALL(i IN range(k+1, size(a)-1) WHERE a[i-1] > a[i])
-    )
+  WHERE size(a) >= 2
+  UNWIND range(0, size(a)-2) AS k
+  WITH a, k
+  WHERE
+    ALL(i IN range(1, k) WHERE a[i-1] < a[i]) AND
+    ALL(i IN range(k+1, size(a)-1) WHERE a[i-1] > a[i])
   RETURN 1 AS row
 }
 RETURN count(*) AS rows
 """
 
-
-# Lifted UD reachability: start at (level=-1, phase='U'), end at any phase='D'
+# Note: prevent reusing the same base relationship along a lifted path
 LIFTED_UD_COUNT = """
 CALL () {
   MATCH (start:StageUD {level: -1, phase:'U'})
   MATCH p = (start)-[:TRANSFER_LIFT_UD*]->(x:StageUD {phase:'D'})
+  WHERE length(p) >= 2
+  WITH relationships(p) AS rs
+  WHERE ALL(r IN rs WHERE r.baseRelEid IS NOT NULL)
+    AND ALL(i IN range(0, size(rs)-1)
+            WHERE NOT rs[i].baseRelEid IN [r IN rs[i+1..] | r.baseRelEid])
   RETURN 1 AS row
 }
 RETURN count(*) AS rows
 """
 
+# -------- Debug signature extraction (multiset) --------
+# Signature format: "r1-r2-...-rm|k", where r* are raw relationship elementIds; k is edge index of the peak.
+DEBUG_BASELINE_SIGS = """
+MATCH p = (s:Account)-[:TRANSFER*]->(t:Account)
+WITH p,
+     [r IN relationships(p) | r.amount] AS a,
+     [r IN relationships(p) | elementId(r)] AS rid
+WHERE size(a) >= 2
+UNWIND range(0, size(a)-2) AS k
+WITH rid, a, k
+WHERE ALL(i IN range(1, k) WHERE a[i-1] < a[i])
+  AND ALL(i IN range(k+1, size(a)-1) WHERE a[i-1] > a[i])
+WITH reduce(s = "", x IN rid |
+     s + CASE s WHEN "" THEN "" ELSE "-" END + x) AS rid_str, k
+RETURN rid_str + "|" + toString(k) AS sig
+"""
+
+DEBUG_LIFTED_SIGS = """
+MATCH (start:StageUD {level:-1, phase:'U'})
+MATCH p = (start)-[:TRANSFER_LIFT_UD*]->(x:StageUD {phase:'D'})
+WHERE length(p) >= 2
+WITH p, nodes(p) AS ns, relationships(p) AS rs
+WHERE ALL(r IN rs WHERE r.baseRelEid IS NOT NULL)
+  AND ALL(i IN range(0, size(rs)-1)
+          WHERE NOT rs[i].baseRelEid IN [r IN rs[i+1..] | r.baseRelEid])
+WITH ns, rs,
+     [i IN range(0, size(ns)-1) WHERE ns[i].phase = 'Peak'][0] AS peak_node_idx,
+     reduce(s = "", r IN rs |
+       s + CASE s WHEN "" THEN "" ELSE "-" END + r.baseRelEid) AS rid_str
+WITH rid_str, (peak_node_idx - 1) AS k_edge
+RETURN rid_str + "|" + toString(k_edge) AS sig
+"""
 
 # ----------------------------
 # Helpers
@@ -189,6 +233,16 @@ def run_count_with_latency(
         p.join()
         raise Neo4jError("ClientEnforcedTimeout", f"Query exceeded {timeout_sec}s")
 
+def run_list(session, cypher: str, params=None, timeout_sec: Optional[float] = None) -> List[str]:
+    """Run a read query and return a list of 'sig' strings."""
+    res = []
+    def work(tx):
+        nonlocal res
+        cur = tx.run(cypher, params or {}, timeout=timeout_sec)
+        res = [r["sig"] for r in cur]
+    session.execute_read(work)
+    return res
+
 # ----------------------------
 # Main
 # ----------------------------
@@ -200,7 +254,7 @@ def main():
     ap.add_argument("--database", default="neo4j")
     ap.add_argument("--accounts", type=int, default=100)
     ap.add_argument("--edges", type=int, nargs="+",
-                    default=[50, 75, 100, 125, 150, 175, 200, 225, 250, 300])
+                    default=[100, 110, 120, 130, 140, 150])
     ap.add_argument("--repeats", type=int, default=10,
                     help="Number of baseline/lifted runs per edge count")
     ap.add_argument("--setup_timeout", type=float, default=15.0,
@@ -212,11 +266,15 @@ def main():
     ap.add_argument("--lift_timeout", type=float, default=None,
                     help="Timeout (seconds) for each lifted run (defaults to --timeout)")
     ap.add_argument("--out", default="ud_baseline_lifted_timeouts.csv")
+    ap.add_argument("--debug", type=int, default=0,
+                    help="If >0 and counts differ, print up to N example mismatches from each side.")
+    ap.add_argument("--debug_timeout", type=float, default=20.0,
+                    help="Timeout (seconds) for each debug signature query.")
     args = ap.parse_args()
     if args.lift_timeout is None:
         args.lift_timeout = args.timeout
 
-    # Timestamped output filename (like your updated script)
+    # Timestamped output filename
     ts = time.strftime("%Y%m%d-%H%M%S")
     out_path = args.out
     if "{ts}" in out_path:
@@ -234,7 +292,9 @@ def main():
         print("Authentication failed: check --user/--password.", file=sys.stderr)
         sys.exit(1)
 
-    results = []
+    # COMPACT rows only
+    compact_rows: List[dict] = []
+
     with driver.session(database=args.database) as s:
         for E in args.edges:
             print(f"Building base graph for E={E} ...", flush=True)
@@ -263,28 +323,24 @@ def main():
             # Build lifted UD graph once per E, and time it (nodes + edges)
             print("  Building lifted UD graph (StageUD) ...", flush=True)
             t0 = time.perf_counter()
-            run_write(s, BUILD_STAGEUD_NODES, timeout_sec=args.build_timeout)
-            run_write(s, BUILD_STAGEUD_EDGES_UU, timeout_sec=args.build_timeout)
-            run_write(s, BUILD_STAGEUD_EDGES_UP, timeout_sec=args.build_timeout)
-            run_write(s, BUILD_STAGEUD_EDGES_PD, timeout_sec=args.build_timeout)
-            run_write(s, BUILD_STAGEUD_EDGES_DD, timeout_sec=args.build_timeout)
+            build_ud(s, build_timeout=args.build_timeout)
             lifted_build_ms = round((time.perf_counter() - t0) * 1000.0, 3)
             print(f"  Lifted UD build time:  {lifted_build_ms} ms", flush=True)
 
             # Per-run results
             base_timeouts = 0
             base_successes = 0
-            base_lat_ms = []
-            base_counts = []
-            base_status = []
+            base_lat_ms: List[object] = []
+            base_counts: List[object] = []
+            base_status: List[str] = []
 
             lift_timeouts = 0
             lift_successes = 0
-            lift_lat_ms = []
-            lift_counts = []
-            lift_status = []
+            lift_lat_ms: List[object] = []
+            lift_counts: List[object] = []
+            lift_status: List[str] = []
 
-            sanity_equal_counts = []  # per-run: True/False/None (None if any timeout)
+            sanity_equal_counts: List[Optional[bool]] = []  # per-run True/False/None
 
             for _ in range(args.repeats):
                 # Baseline UD
@@ -345,73 +401,73 @@ def main():
             sanity_ok_runs = sum(1 for x in sanity_equal_counts if x is True)
             sanity_mismatch_runs = sum(1 for x in sanity_equal_counts if x is False)
 
-            results.append({
+            # Choose a representative count (they should all be equal when sanity_ok)
+            count_sample = next((c for c in base_counts if isinstance(c, int)), "")
+            speedup = round(base_avg_ms / lift_avg_ms, 3) if (isinstance(base_avg_ms, float) and isinstance(lift_avg_ms, float) and lift_avg_ms > 0) else ""
+
+            # Append COMPACT row
+            compact_rows.append({
                 "edges": E,
                 "runs": args.repeats,
-
-                # Baseline build (original graph population)
-                "baseline_build_ms": baseline_build_ms,
-
-                # Baseline summary
+                "count_per_run": count_sample,
+                "baseline_avg_ms": base_avg_ms,
+                "lifted_avg_ms": lift_avg_ms,
+                "speedup_x": speedup,
                 "baseline_timeouts": base_timeouts,
-                "baseline_successes": base_successes,
-                "baseline_avg_latency_ms": base_avg_ms,
-                "baseline_run_latencies_ms": json.dumps(base_lat_ms),
-                "baseline_run_counts": json.dumps(base_counts),
-                "baseline_run_statuses": json.dumps(base_status),
-
-                # Lifted build
-                "lifted_build_ms": lifted_build_ms,
-                "lifted_build_ms_per_run": json.dumps(
-                    [lifted_build_ms for _ in range(args.repeats)]
-                ),
-
-                # Lifted summary
                 "lifted_timeouts": lift_timeouts,
-                "lifted_successes": lift_successes,
-                "lifted_avg_latency_ms": lift_avg_ms,
-                "lifted_run_latencies_ms": json.dumps(lift_lat_ms),
-                "lifted_run_counts": json.dumps(lift_counts),
-                "lifted_run_statuses": json.dumps(lift_status),
-
-                # Sanity (per run and totals)
-                "sanity_equal_counts_per_run": json.dumps(sanity_equal_counts),
+                "baseline_build_ms": baseline_build_ms,
+                "lifted_build_ms": lifted_build_ms,
                 "sanity_ok_runs": sanity_ok_runs,
                 "sanity_mismatch_runs": sanity_mismatch_runs,
             })
 
+            # Console summary
             print(
                 f"E={E}: base BUILD={baseline_build_ms} ms; "
                 f"baseline avg={base_avg_ms} ms ({base_successes}/{args.repeats} ok, {base_timeouts} timeouts); "
-                f"lifted UD BUILD={lifted_build_ms} ms; lifted UD avg={lift_avg_ms} ms "
+                f"lifted UD BUILD={lifted_build_ms} ms; lifted avg={lift_avg_ms} ms "
                 f"({lift_successes}/{args.repeats} ok, {lift_timeouts} timeouts); "
-                f"sanity ok runs={sanity_ok_runs}, mismatches={sanity_mismatch_runs}",
+                f"speedup≈{speedup}×; sanity ok runs={sanity_ok_runs}, mismatches={sanity_mismatch_runs}",
                 flush=True
             )
 
-    # Write CSV
+            # ---------- DEBUG: print mismatches ----------
+            if args.debug > 0 and sanity_mismatch_runs > 0:
+                print(f"[DEBUG] Counts differ for E={E}. Collecting signatures ...", flush=True)
+                try:
+                    baseline_sigs = run_list(s, DEBUG_BASELINE_SIGS, timeout_sec=args.debug_timeout)
+                    lifted_sigs   = run_list(s, DEBUG_LIFTED_SIGS,   timeout_sec=args.debug_timeout)
+                    cb = Counter(baseline_sigs)
+                    cl = Counter(lifted_sigs)
+                    only_b = list((cb - cl).elements())
+                    only_l = list((cl - cb).elements())
+                    print(f"[DEBUG] baseline total sigs: {sum(cb.values())}, lifted total sigs: {sum(cl.values())}")
+                    print(f"[DEBUG] in baseline only: {len(only_b)}, in lifted only: {len(only_l)}")
+                    if only_b:
+                        print("[DEBUG] sample baseline-only:")
+                        for sig in only_b[:args.debug]:
+                            print("  ", sig)
+                    if only_l:
+                        print("[DEBUG] sample lifted-only:")
+                        for sig in only_l[:args.debug]:
+                            print("  ", sig)
+                except Neo4jError as e:
+                    print(f"[DEBUG] Error while collecting debug signatures: {e}", file=sys.stderr)
+
+    # ----- write COMPACT CSV -----
     fieldnames = [
         "edges", "runs",
-
-        "baseline_build_ms",
-
-        "baseline_timeouts", "baseline_successes",
-        "baseline_avg_latency_ms", "baseline_run_latencies_ms",
-        "baseline_run_counts", "baseline_run_statuses",
-
-        "lifted_build_ms", "lifted_build_ms_per_run",
-        "lifted_timeouts", "lifted_successes",
-        "lifted_avg_latency_ms", "lifted_run_latencies_ms",
-        "lifted_run_counts", "lifted_run_statuses",
-
-        "sanity_equal_counts_per_run", "sanity_ok_runs", "sanity_mismatch_runs",
+        "count_per_run",
+        "baseline_avg_ms", "lifted_avg_ms", "speedup_x",
+        "baseline_timeouts", "lifted_timeouts",
+        "baseline_build_ms", "lifted_build_ms",
+        "sanity_ok_runs", "sanity_mismatch_runs",
     ]
     with open(out_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(results)
+        writer.writerows(compact_rows)
     print(f"Wrote {out_path}")
-
 
 if __name__ == "__main__":
     try:
