@@ -285,7 +285,6 @@ def main():
 
                 for r in range(args.repeats):
                     if args.rebuild_each_run:
-                        print(f"  [Run {r+1}/{args.repeats}] Rebuilding graph for E={E}, H={H} ...", flush=True)
                         b_ms, l_ms = build_graph_once(
                             s, args.accounts, E, args.setup_timeout, args.build_timeout
                         )
