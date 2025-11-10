@@ -1,6 +1,27 @@
 #!/usr/bin/env python3
+"""
+experiments_bounded_paths.py
+
+flag guide:
+  --uri              Bolt URI (default bolt://127.0.0.1:7687)
+  --user             Neo4j username (default neo4j)
+  --password         Neo4j password (REQUIRED)
+  --database         Neo4j database name (default neo4j)
+  --accounts         N: number of Account nodes to create per build
+  --edges            E list: edge counts to test (supports shell seq)
+  --hops             H list: max path length(s); each H means 1..H
+  --repeats          Number of timing runs per (E,H)
+  --setup_timeout    Timeout for RESET/SCHEMA/POPULATE (seconds)
+  --build_timeout    Timeout for lifted-graph build (seconds)
+  --timeout          Timeout for baseline query (seconds)
+  --lift_timeout     Timeout for lifted query (defaults to --timeout)
+  --out              Output CSV path (timestamp auto-appended unless {ts} in name)
+  --rebuild_each_run If set, REBUILD (RESET+populate+lift) before EVERY run.
+                     If not set (default), build once per E and reuse across runs.
+"""
+
 # Example:
-#   python3 experiments_bounded_paths.py --password ItayBachar88 --setup_timeout 20 --timeout 10 --edges $(seq 100 20 160) --hops $(seq 5 5 10)
+#   python3 experiments_bounded_paths.py --password ItayBachar88 --setup_timeout 20 --timeout 10 --edges $(seq 100 20 300) --hops $(seq 5 5 10) --rebuild_each_run
 
 import argparse
 import csv
@@ -38,7 +59,7 @@ WITH collect(a) AS nodes, size(collect(a)) AS n
 UNWIND range(1, $n_edges) AS k
 WITH nodes, n,
      toInteger(rand()*n) AS i,
-     toInteger(rand()*n) AS j
+     toInteger(rand()*n) As j
 WITH nodes[i] AS u, nodes[j] AS v
 WHERE u <> v
 CREATE (u)-[:TRANSFER {
@@ -149,6 +170,28 @@ def run_count_with_latency(
         p.join()
         raise Neo4jError("ClientEnforcedTimeout", f"Query exceeded {timeout_sec}s")
 
+def build_graph_once(session, accounts: int, edges: int,
+                     setup_timeout: float, build_timeout: float) -> Tuple[float, float]:
+    """RESET + SCHEMA + populate + build lifted. Return (baseline_build_ms, lifted_build_ms)."""
+    # Fresh graph
+    run_write(session, RESET, timeout_sec=setup_timeout)
+    for stmt in SCHEMA_STMTS:
+        run_write(session, stmt, timeout_sec=setup_timeout)
+
+    # Populate base graph
+    t0 = time.perf_counter()
+    run_write(session, POPULATE_ACCOUNTS, params={"n_accounts": accounts}, timeout_sec=setup_timeout)
+    run_write(session, POPULATE_TRANSFERS, params={"n_edges": edges}, timeout_sec=setup_timeout)
+    baseline_build_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+
+    # Build lifted graph
+    t0 = time.perf_counter()
+    run_write(session, BUILD_STAGE_NODES, timeout_sec=build_timeout)
+    run_write(session, BUILD_STAGE_EDGES, timeout_sec=build_timeout)
+    lifted_build_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+
+    return baseline_build_ms, lifted_build_ms
+
 # ----------------------------
 # Main
 # ----------------------------
@@ -178,6 +221,9 @@ def main():
     ap.add_argument("--lift_timeout", type=float, default=None,
                     help="Timeout (seconds) for each lifted run (defaults to --timeout)")
     ap.add_argument("--out", default="baseline_lifted_bounded.csv")
+    ap.add_argument("--rebuild_each_run", action="store_true",
+                    help="If set, rebuild (RESET+populate+lift) before EVERY run; "
+                         "otherwise build once per E and reuse for all repeats.")
     args = ap.parse_args()
     if args.lift_timeout is None:
         args.lift_timeout = args.timeout
@@ -203,42 +249,22 @@ def main():
     results = []
     with driver.session(database=args.database) as s:
         for E in args.edges:
-            print(f"Building base graph for E={E} ...", flush=True)
+            print(f"=== E={E} ===", flush=True)
 
-            # Fresh graph for this edge count (use setup timeout)
-            run_write(s, RESET, timeout_sec=args.setup_timeout)
-            for stmt in SCHEMA_STMTS:
-                run_write(s, stmt, timeout_sec=args.setup_timeout)
-
-            # --- Time the ORIGINAL graph build (populate accounts + transfers) ---
-            print("  Populating base graph ...", flush=True)
-            t0 = time.perf_counter()
-            run_write(
-                s, POPULATE_ACCOUNTS,
-                params={"n_accounts": args.accounts},
-                timeout_sec=args.setup_timeout
-            )
-            run_write(
-                s, POPULATE_TRANSFERS,
-                params={"n_edges": E},
-                timeout_sec=args.setup_timeout
-            )
-            baseline_build_ms = round((time.perf_counter() - t0) * 1000.0, 3)
-            print(f"  Baseline build time: {baseline_build_ms} ms", flush=True)
-
-            # Build lifted graph once per E, and time it (nodes + edges)
-            print("  Building lifted graph (StageLift) ...", flush=True)
-            t0 = time.perf_counter()
-            run_write(s, BUILD_STAGE_NODES, timeout_sec=args.build_timeout)
-            run_write(s, BUILD_STAGE_EDGES, timeout_sec=args.build_timeout)
-            lifted_build_ms = round((time.perf_counter() - t0) * 1000.0, 3)
-            print(f"  Lifted build time:  {lifted_build_ms} ms", flush=True)
+            # If not rebuilding each run: build once per E here
+            if not args.rebuild_each_run:
+                print("  Populating base graph ...", flush=True)
+                baseline_build_ms, lifted_build_ms = build_graph_once(
+                    s, args.accounts, E, args.setup_timeout, args.build_timeout
+                )
+                print(f"  Baseline build time: {baseline_build_ms} ms", flush=True)
+                print(f"  Lifted   build time: {lifted_build_ms} ms", flush=True)
 
             for H in args.hops:
-                # Prepare bounded queries for this H
                 BASELINE_COUNT = make_BASELINE_COUNT(H)
                 LIFTED_COUNT   = make_LIFTED_COUNT(H)
 
+                # Per (E,H) accumulators
                 base_timeouts = 0
                 base_successes = 0
                 base_lat_ms = []
@@ -251,10 +277,22 @@ def main():
                 lift_counts = []
                 lift_status = []
 
-                sanity_equal_counts = []  # per-run: True/False/None (None if any timeout)
+                sanity_equal_counts = []  # per run True/False/None
 
-                for _ in range(args.repeats):
-                    # Baseline
+                # For rebuild_each_run: collect per-run build times to average
+                per_run_baseline_build_ms = []
+                per_run_lifted_build_ms = []
+
+                for r in range(args.repeats):
+                    if args.rebuild_each_run:
+                        print(f"  [Run {r+1}/{args.repeats}] Rebuilding graph for E={E}, H={H} ...", flush=True)
+                        b_ms, l_ms = build_graph_once(
+                            s, args.accounts, E, args.setup_timeout, args.build_timeout
+                        )
+                        per_run_baseline_build_ms.append(b_ms)
+                        per_run_lifted_build_ms.append(l_ms)
+
+                    # Baseline query
                     b_rows: Optional[int] = None
                     try:
                         rows, elapsed = run_count_with_latency(
@@ -275,7 +313,7 @@ def main():
                         else:
                             raise
 
-                    # Lifted
+                    # Lifted query
                     l_rows: Optional[int] = None
                     try:
                         rows, elapsed = run_count_with_latency(
@@ -312,6 +350,11 @@ def main():
                 sanity_ok_runs = sum(1 for x in sanity_equal_counts if x is True)
                 sanity_mismatch_runs = sum(1 for x in sanity_equal_counts if x is False)
 
+                # Final build times to report for this (E,H)
+                if args.rebuild_each_run:
+                    baseline_build_ms = round(sum(per_run_baseline_build_ms) / len(per_run_baseline_build_ms), 3) if per_run_baseline_build_ms else ""
+                    lifted_build_ms   = round(sum(per_run_lifted_build_ms)   / len(per_run_lifted_build_ms), 3) if per_run_lifted_build_ms else ""
+
                 results.append({
                     "edges": E,
                     "hops": H,
@@ -346,11 +389,12 @@ def main():
                     f"E={E}, H={H}: baseline avg={base_avg_ms} ms "
                     f"({base_successes}/{args.repeats} ok, {base_timeouts} to); "
                     f"lifted avg={lift_avg_ms} ms ({lift_successes}/{args.repeats} ok, {lift_timeouts} to); "
-                    f"sanity ok={sanity_ok_runs}, mismatches={sanity_mismatch_runs}",
+                    f"sanity ok={sanity_ok_runs}, mismatches={sanity_mismatch_runs}; "
+                    f"builds (avg ms): base={baseline_build_ms}, lifted={lifted_build_ms}",
                     flush=True
                 )
 
-    # Write CSV (same schema as original + 'hops' + lifted_build_ms near baseline_build_ms)
+    # Write CSV
     fieldnames = [
         "edges", "hops", "runs",
         "baseline_build_ms", "lifted_build_ms",
@@ -365,10 +409,13 @@ def main():
 
         "sanity_equal_counts_per_run", "sanity_ok_runs", "sanity_mismatch_runs",
     ]
-    with open(out_path, "w", newline="") as f:
+    write_header = not Path(out_path).exists()
+    with open(out_path, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
+        if write_header:
+            writer.writeheader()
         writer.writerows(results)
+
     print(f"Wrote {out_path}")
 
 if __name__ == "__main__":
