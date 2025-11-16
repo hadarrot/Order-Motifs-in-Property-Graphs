@@ -354,6 +354,16 @@ def main():
                 if args.rebuild_each_run:
                     baseline_build_ms = round(sum(per_run_baseline_build_ms) / len(per_run_baseline_build_ms), 3) if per_run_baseline_build_ms else ""
                     lifted_build_ms   = round(sum(per_run_lifted_build_ms)   / len(per_run_lifted_build_ms), 3) if per_run_lifted_build_ms else ""
+                                # Speedup: baseline_avg_query / (lifted_build + lifted_avg_query)
+                if (
+                    isinstance(base_avg_ms, (int, float))
+                    and isinstance(lift_avg_ms, (int, float))
+                    and isinstance(lifted_build_ms, (int, float))
+                    and (lifted_build_ms + lift_avg_ms) > 0
+                ):
+                    speedup = round(base_avg_ms / (lifted_build_ms + lift_avg_ms), 3)
+                else:
+                    speedup = ""
 
                 results.append({
                     "edges": E,
@@ -371,6 +381,8 @@ def main():
                     "lifted_successes": lift_successes,
                     "lifted_avg_latency_ms": lift_avg_ms,
 
+                    "speedup": speedup,
+
                     "sanity_ok_runs": sanity_ok_runs,
                     "sanity_mismatch_runs": sanity_mismatch_runs,
                     "sanity_all_equal": sanity_all_equal,
@@ -382,6 +394,7 @@ def main():
                     f"lifted avg={lift_avg_ms} ms ({lift_successes}/{args.repeats} ok, {lift_timeouts} to); "
                     f"sanity ok={sanity_ok_runs}, mismatches={sanity_mismatch_runs}; "
                     f"builds (avg ms): base={baseline_build_ms}, lifted={lifted_build_ms}",
+                    f"speedup={speedup}",
                     flush=True
                 )
 
@@ -391,6 +404,7 @@ def main():
         "baseline_build_ms", "lifted_build_ms",
         "baseline_timeouts", "baseline_successes", "baseline_avg_latency_ms",
         "lifted_timeouts", "lifted_successes", "lifted_avg_latency_ms",
+        "speedup",
         "sanity_ok_runs", "sanity_mismatch_runs", "sanity_all_equal",
     ]
     write_header = not Path(out_path).exists()
