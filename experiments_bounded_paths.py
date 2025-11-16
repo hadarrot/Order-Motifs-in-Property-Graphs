@@ -16,8 +16,8 @@ flag guide:
   --timeout          Timeout for baseline query (seconds)
   --lift_timeout     Timeout for lifted query (defaults to --timeout)
   --out              Output CSV path (timestamp auto-appended unless {ts} in name)
-  --rebuild_each_run If set, REBUILD (RESET+populate+lift) before EVERY run.
-                     If not set (default), build once per E and reuse across runs.
+
+  NOTE: The script now ALWAYS rebuilds (RESET+populate+lift) before EVERY run.
 """
 
 # Example:
@@ -222,7 +222,9 @@ def main():
                     help="Timeout (seconds) for each lifted run (defaults to --timeout)")
     ap.add_argument("--out", default="baseline_lifted_bounded.csv")
     args = ap.parse_args()
-    args.rebuild_each_run = True  
+
+    args.rebuild_each_run = True
+
     if args.lift_timeout is None:
         args.lift_timeout = args.timeout
 
@@ -346,6 +348,7 @@ def main():
 
                 sanity_ok_runs = sum(1 for x in sanity_equal_counts if x is True)
                 sanity_mismatch_runs = sum(1 for x in sanity_equal_counts if x is False)
+                sanity_all_equal = 1 if (sanity_mismatch_runs == 0 and sanity_ok_runs > 0) else 0  
 
                 # Final build times to report for this (E,H)
                 if args.rebuild_each_run:
@@ -360,26 +363,17 @@ def main():
                     "baseline_build_ms": baseline_build_ms,
                     "lifted_build_ms": lifted_build_ms,
 
-                    # Baseline summary
                     "baseline_timeouts": base_timeouts,
                     "baseline_successes": base_successes,
                     "baseline_avg_latency_ms": base_avg_ms,
-                    "baseline_run_latencies_ms": json.dumps(base_lat_ms),
-                    "baseline_run_counts": json.dumps(base_counts),
-                    "baseline_run_statuses": json.dumps(base_status),
 
-                    # Lifted summary
                     "lifted_timeouts": lift_timeouts,
                     "lifted_successes": lift_successes,
                     "lifted_avg_latency_ms": lift_avg_ms,
-                    "lifted_run_latencies_ms": json.dumps(lift_lat_ms),
-                    "lifted_run_counts": json.dumps(lift_counts),
-                    "lifted_run_statuses": json.dumps(lift_status),
 
-                    # Sanity
-                    "sanity_equal_counts_per_run": json.dumps(sanity_equal_counts),
                     "sanity_ok_runs": sanity_ok_runs,
                     "sanity_mismatch_runs": sanity_mismatch_runs,
+                    "sanity_all_equal": sanity_all_equal,
                 })
 
                 print(
@@ -395,16 +389,9 @@ def main():
     fieldnames = [
         "edges", "hops", "runs",
         "baseline_build_ms", "lifted_build_ms",
-
-        "baseline_timeouts", "baseline_successes",
-        "baseline_avg_latency_ms", "baseline_run_latencies_ms",
-        "baseline_run_counts", "baseline_run_statuses",
-
-        "lifted_timeouts", "lifted_successes",
-        "lifted_avg_latency_ms", "lifted_run_latencies_ms",
-        "lifted_run_counts", "lifted_run_statuses",
-
-        "sanity_equal_counts_per_run", "sanity_ok_runs", "sanity_mismatch_runs",
+        "baseline_timeouts", "baseline_successes", "baseline_avg_latency_ms",
+        "lifted_timeouts", "lifted_successes", "lifted_avg_latency_ms",
+        "sanity_ok_runs", "sanity_mismatch_runs", "sanity_all_equal",
     ]
     write_header = not Path(out_path).exists()
     with open(out_path, "a", newline="") as f:
