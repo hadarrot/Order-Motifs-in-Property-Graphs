@@ -21,7 +21,7 @@ flag guide:
 """
 
 # Example:
-#   python3 experiments_bounded_paths.py --password ItayBachar88 --setup_timeout 20 --timeout 10 --edges $(seq 100 20 300) --hops $(seq 5 5 10) --rebuild_each_run
+#   python3 experiments_bounded_paths.py --password ItayBachar88 --setup_timeout 20 --timeout 10 --edges $(seq 100 20 160) --hops $(seq 5 5 10)
 
 import argparse
 import csv
@@ -221,10 +221,8 @@ def main():
     ap.add_argument("--lift_timeout", type=float, default=None,
                     help="Timeout (seconds) for each lifted run (defaults to --timeout)")
     ap.add_argument("--out", default="baseline_lifted_bounded.csv")
-    ap.add_argument("--rebuild_each_run", action="store_true",
-                    help="If set, rebuild (RESET+populate+lift) before EVERY run; "
-                         "otherwise build once per E and reuse for all repeats.")
     args = ap.parse_args()
+    args.rebuild_each_run = True  
     if args.lift_timeout is None:
         args.lift_timeout = args.timeout
 
