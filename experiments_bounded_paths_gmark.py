@@ -629,7 +629,7 @@ def main():
                     "sanity_all_equal": sanity_all_equal,
                 })
 
-                print(f"E={E}, H={H}: baseline_avg={base_avg}ms, lifted_build_avg={lift_build_avg}ms, lifted_avg={lift_avg}ms, speedup={speedup}")
+                print(f"E={E}, H={H}: baseline_build_avg={base_build_avg}ms, baseline_avg={base_avg}ms, lifted_build_avg={lift_build_avg}ms, lifted_avg={lift_avg}ms, speedup={speedup}")
 
     # Write CSV
     fields = [
