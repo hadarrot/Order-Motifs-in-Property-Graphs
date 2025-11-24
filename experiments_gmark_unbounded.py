@@ -15,7 +15,7 @@ TRANSFER paths), but:
 Thus every run sees a different random graph, and counts can differ between runs.
 """
 
-# python3 experiments_gmark_unbounded.py --password ItayBachar88 --gmark_dir gmark --gmark_schema shop.xml --accounts 1000 --edges 1000 5000 10000 --repeats 10 \ --out baseline_lifted_gmark.csv
+# python3 experiments_gmark_unbounded.py --password ItayBachar88 --gmark_dir gmark --gmark_schema shop.xml --accounts 1000 --edges 1000 5000 10000 --repeats 10 --out baseline_lifted_gmark.csv
 
 import argparse
 import csv
@@ -503,6 +503,14 @@ def main():
                         else:
                             raise
 
+                    # Print baseline query latency/status for this run
+                    if base_status:
+                        last_status = base_status[-1]
+                        if last_status == "ok":
+                            print(f"    baseline query: {base_counts[-1]} rows in {base_lat_ms[-1]} ms", flush=True)
+                        else:
+                            print(f"    baseline query: {last_status}", flush=True)
+
                     # Lifted query
                     l_rows: Optional[int] = None
                     try:
@@ -523,6 +531,14 @@ def main():
                             lift_status.append("timeout")
                         else:
                             raise
+
+                    # Print lifted query latency/status for this run
+                    if lift_status:
+                        last_status = lift_status[-1]
+                        if last_status == "ok":
+                            print(f"    lifted query: {lift_counts[-1]} rows in {lift_lat_ms[-1]} ms", flush=True)
+                        else:
+                            print(f"    lifted query: {last_status}", flush=True)
 
                     # Per-run sanity
                     if (b_rows is not None) and (l_rows is not None):
@@ -589,6 +605,28 @@ def main():
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(results)
+    
+    # Write summary section
+    with open(out_path, "a", newline="") as f:
+        f.write("\n\n# Summary\n")
+        f.write("Nodes,Edges,Baseline Build (ms),Lifted Build (ms),Baseline Avg Latency (ms),Lifted Avg Latency (ms),Speedup\n")
+        
+        for result in results:
+            edges = result["edges"]
+            nodes = args.accounts
+            baseline_build = result["baseline_build_ms"]
+            lifted_build = result["lifted_build_ms"]
+            baseline_latency = result["baseline_avg_latency_ms"]
+            lifted_latency = result["lift_avg_latency_ms"]
+            
+            # Calculate speedup (baseline_latency / lifted_latency)
+            speedup = ""
+            if isinstance(baseline_latency, (int, float)) and isinstance(lifted_latency, (int, float)):
+                if lifted_latency > 0:
+                    speedup = round(baseline_latency / lifted_latency, 3)
+            
+            f.write(f"{nodes},{edges},{baseline_build},{lifted_build},{baseline_latency},{lifted_latency},{speedup}\n")
+    
     print(f"Wrote {out_path}")
 
 
