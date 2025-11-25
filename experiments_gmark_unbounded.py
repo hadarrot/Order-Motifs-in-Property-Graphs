@@ -7,6 +7,7 @@ experiments_gmark_unbounded_rebuild.py
 - Writes TWO output files incrementally:
   1. *_details.csv: Full details with JSON arrays. "timeout" used for timeouts.
   2. *_summary.csv: Clean summary. "N/A" used for missing averages.
+- Records the execution command at the top of both files.
 """
 
 import argparse
@@ -240,6 +241,9 @@ def run_count_with_latency(uri, user, password, database, cypher, params=None, t
 # ----------------------------
 
 def main():
+    # Capture command line arguments before anything else
+    command_line_str = "# Command: " + " ".join(sys.argv)
+
     ap = argparse.ArgumentParser(description="Baseline vs Lifted (gMark rebuilds)")
     ap.add_argument("--uri", default="bolt://127.0.0.1:7687")
     ap.add_argument("--user", default="neo4j")
@@ -292,7 +296,10 @@ def main():
         "lift_run_latencies_ms", "lift_run_counts", "lift_run_statuses",
         "sanity_equal_true", "sanity_equal_false", "sanity_equal_values",
     ]
+    
+    # Initialize Details File: Write command -> Write Header
     with open(out_details, "w", newline="") as f:
+        f.write(command_line_str + "\n")
         writer = csv.DictWriter(f, fieldnames=details_fields)
         writer.writeheader()
         f.flush()
@@ -303,7 +310,10 @@ def main():
         "Baseline Avg Latency (ms)", "Lifted Avg Latency (ms)", 
         "Speedup"
     ]
+    
+    # Initialize Summary File: Write command -> Write Header
     with open(out_summary, "w", newline="") as f:
+        f.write(command_line_str + "\n")
         writer = csv.DictWriter(f, fieldnames=summary_fields)
         writer.writeheader()
         f.flush()
@@ -365,8 +375,8 @@ def main():
                         except Neo4jError as e:
                             if is_timeout_error(e) or getattr(e, "args", [None])[0] == "ClientEnforcedTimeout":
                                 base_timeouts += 1
-                                base_lat_ms.append("timeout")  # <-- Changed from "" to "timeout"
-                                base_counts.append("timeout")
+                                base_lat_ms.append("timeout")  # <-- Changed
+                                base_counts.append("timeout")  # <-- Changed
                                 base_status.append("timeout")
                             else: raise
 
@@ -382,8 +392,8 @@ def main():
                         except Neo4jError as e:
                             if is_timeout_error(e) or getattr(e, "args", [None])[0] == "ClientEnforcedTimeout":
                                 lift_timeouts += 1
-                                lift_lat_ms.append("timeout")  # <-- Changed from "" to "timeout"
-                                lift_counts.append("timeout")
+                                lift_lat_ms.append("timeout")  # <-- Changed
+                                lift_counts.append("timeout")  # <-- Changed
                                 lift_status.append("timeout")
                             else: raise
 
@@ -398,7 +408,7 @@ def main():
                 baseline_build_ms = round(sum(baseline_build_runs) / len(baseline_build_runs), 3) if baseline_build_runs else 0
                 lifted_build_ms = round(sum(lifted_build_runs) / len(lifted_build_runs), 3) if lifted_build_runs else 0
 
-                # 2. Baseline Avg (Numerical for calc, String for display)
+                # 2. Baseline Avg
                 base_ok_lat = [x for x in base_lat_ms if isinstance(x, (int, float))]
                 if base_ok_lat:
                     base_avg_num = sum(base_ok_lat) / len(base_ok_lat)
@@ -406,8 +416,8 @@ def main():
                     base_avg_summary = round(base_avg_num, 3)
                 else:
                     base_avg_num = None
-                    base_avg_details = "timeout"   # Details: "timeout"
-                    base_avg_summary = "N/A"  # Summary: "N/A"
+                    base_avg_details = "timeout" # <-- Changed
+                    base_avg_summary = "N/A"
 
                 # 3. Lifted Avg
                 lift_ok_lat = [x for x in lift_lat_ms if isinstance(x, (int, float))]
@@ -417,11 +427,10 @@ def main():
                     lift_avg_summary = round(lift_avg_num, 3)
                 else:
                     lift_avg_num = None
-                    lift_avg_details = "timeout"
+                    lift_avg_details = "timeout" # <-- Changed
                     lift_avg_summary = "N/A"
 
                 # --- Calculate Speedup ---
-                # Speedup = (Baseline Avg Query) / (Lifted Build + Lifted Avg Query)
                 speedup = "N/A"
                 if (base_avg_num is not None) and (lift_avg_num is not None):
                     total_lifted_cost = lifted_build_ms + lift_avg_num
