@@ -15,8 +15,7 @@ TRANSFER paths), but:
 Thus every run sees a different random graph, and counts can differ between runs.
 """
 
-# python3 experiments_gmark_unbounded.py --password ItayBachar88 --gmark_dir gmark --gmark_schema shop.xml --accounts 1000 --edges 1000 5000 10000 --repeats 10 --out baseline_lifted_gmark.csv
-
+# python3 experiments_gmark_unbounded.py     --password ItayBachar88     --accounts 1000 5000 25000     --densities 1.0 5.0 10.0         --out my_experiment_results.csv
 import argparse
 import csv
 import json
@@ -370,11 +369,12 @@ def main():
     ap.add_argument("--user", default="neo4j")
     ap.add_argument("--password", required=True)
     ap.add_argument("--database", default="neo4j")
-
-    ap.add_argument("--accounts", type=int, default=100,
-                    help="Target number of accounts (nodes) for gMark - passed as -n.")
-    ap.add_argument("--edges", type=int, nargs="+",
-                    default=[50, 75, 100, 125, 150, 175, 200, 225, 250, 300])
+ 
+    ap.add_argument("--accounts", type=int, nargs="+", default=[100],
+                    help="Target number of accounts (nodes) for gMark. Can specify multiple values.")
+    ap.add_argument("--densities", type=float, nargs="+",
+                    default=[0.5, 1.0, 1.5, 2.0, 2.5, 3.0],
+                    help="Graph densities to test. Edges = Accounts * Density. Can specify multiple values.")
     ap.add_argument("--repeats", type=int, default=10,
                     help="Number of runs per edge count. EACH run rebuilds the graph.")
 
@@ -422,129 +422,131 @@ def main():
     results = []
 
     with driver:
-        for E in args.edges:
-            print(f"=== E={E} ===", flush=True)
+        for N in args.accounts:
+            for D in args.densities:
+                E = int(N * D)
+                print(f"=== N={N}, D={D} (E={E}) ===", flush=True)
 
-            baseline_build_runs = []
-            lifted_build_runs = []
+                baseline_build_runs = []
+                lifted_build_runs = []
 
-            base_timeouts = 0
-            base_successes = 0
-            base_lat_ms = []
-            base_counts = []
-            base_status = []
+                base_timeouts = 0
+                base_successes = 0
+                base_lat_ms = []
+                base_counts = []
+                base_status = []
 
-            lift_timeouts = 0
-            lift_successes = 0
-            lift_lat_ms = []
-            lift_counts = []
-            lift_status = []
+                lift_timeouts = 0
+                lift_successes = 0
+                lift_lat_ms = []
+                lift_counts = []
+                lift_status = []
 
-            sanity_equal_counts = []
+                sanity_equal_counts = []
 
-            for r in range(args.repeats):
-                print(f"  run {r+1}/{args.repeats}", flush=True)
+                for r in range(args.repeats):
+                    print(f"  run {r+1}/{args.repeats}", flush=True)
 
-                output_dir = os.path.join(args.tmp_dir, f"gmark_E{E}_run{r}")
-                csv_edges = generate_graph_gmark(
-                    schema=args.gmark_schema,
-                    n_nodes=args.accounts,
-                    n_edges=E,
-                    gmark_dir=args.gmark_dir,
-                    output_dir=output_dir,
-                )
-
-                with driver.session(database=args.database) as s:
-                    # Reset graph + (re)apply schema
-                    run_write(s, RESET, timeout_sec=args.setup_timeout)
-                    for stmt in SCHEMA_STMTS:
-                        run_write(s, stmt, timeout_sec=args.setup_timeout)
-
-                    # Load graph (baseline build for this run)
-                    t0 = time.perf_counter()
-                    loaded_edges = load_graph_from_csv(
-                        s, csv_edges, setup_timeout=args.setup_timeout
+                    output_dir = os.path.join(args.tmp_dir, f"gmark_N{N}_E{E}_run{r}")
+                    csv_edges = generate_graph_gmark(
+                        schema=args.gmark_schema,
+                        n_nodes=N,
+                        n_edges=E,
+                        gmark_dir=args.gmark_dir,
+                        output_dir=output_dir,
                     )
-                    baseline_build_ms_run = round(
-                        (time.perf_counter() - t0) * 1000.0, 3
-                    )
-                    baseline_build_runs.append(baseline_build_ms_run)
-                    print(f"    run {r+1}: loaded {loaded_edges} edges in {baseline_build_ms_run} ms",
-                          flush=True)
 
-                    # Build StageLift for this run
-                    t0 = time.perf_counter()
-                    run_write(s, BUILD_STAGE_NODES, timeout_sec=args.build_timeout)
-                    run_write(s, BUILD_STAGE_EDGES, timeout_sec=args.build_timeout)
-                    lifted_build_ms_run = round(
-                        (time.perf_counter() - t0) * 1000.0, 3
-                    )
-                    lifted_build_runs.append(lifted_build_ms_run)
-                    print(f"    run {r+1}: lifted build {lifted_build_ms_run} ms", flush=True)
+                    with driver.session(database=args.database) as s:
+                        # Reset graph + (re)apply schema
+                        run_write(s, RESET, timeout_sec=args.setup_timeout)
+                        for stmt in SCHEMA_STMTS:
+                            run_write(s, stmt, timeout_sec=args.setup_timeout)
 
-                    # Baseline query
-                    b_rows: Optional[int] = None
-                    try:
-                        rows, elapsed = run_count_with_latency(
-                            args.uri, args.user, args.password, args.database,
-                            BASELINE_COUNT, timeout_sec=args.timeout
+                        # Load graph (baseline build for this run)
+                        t0 = time.perf_counter()
+                        loaded_edges = load_graph_from_csv(
+                            s, csv_edges, setup_timeout=args.setup_timeout
                         )
-                        base_successes += 1
-                        base_lat_ms.append(round(elapsed * 1000.0, 3))
-                        base_counts.append(int(rows))
-                        base_status.append("ok")
-                        b_rows = int(rows)
-                    except Neo4jError as e:
-                        if is_timeout_error(e) or getattr(e, "args", [None])[0] == "ClientEnforcedTimeout":
-                            base_timeouts += 1
-                            base_lat_ms.append("")
-                            base_counts.append("")
-                            base_status.append("timeout")
-                        else:
-                            raise
-
-                    # Print baseline query latency/status for this run
-                    if base_status:
-                        last_status = base_status[-1]
-                        if last_status == "ok":
-                            print(f"    baseline query: {base_counts[-1]} rows in {base_lat_ms[-1]} ms", flush=True)
-                        else:
-                            print(f"    baseline query: {last_status}", flush=True)
-
-                    # Lifted query
-                    l_rows: Optional[int] = None
-                    try:
-                        rows, elapsed = run_count_with_latency(
-                            args.uri, args.user, args.password, args.database,
-                            LIFTED_COUNT, timeout_sec=args.lift_timeout
+                        baseline_build_ms_run = round(
+                            (time.perf_counter() - t0) * 1000.0, 3
                         )
-                        lift_successes += 1
-                        lift_lat_ms.append(round(elapsed * 1000.0, 3))
-                        lift_counts.append(int(rows))
-                        lift_status.append("ok")
-                        l_rows = int(rows)
-                    except Neo4jError as e:
-                        if is_timeout_error(e) or getattr(e, "args", [None])[0] == "ClientEnforcedTimeout":
-                            lift_timeouts += 1
-                            lift_lat_ms.append("")
-                            lift_counts.append("")
-                            lift_status.append("timeout")
-                        else:
-                            raise
+                        baseline_build_runs.append(baseline_build_ms_run)
+                        print(f"    run {r+1}: loaded {loaded_edges} edges in {baseline_build_ms_run} ms",
+                              flush=True)
 
-                    # Print lifted query latency/status for this run
-                    if lift_status:
-                        last_status = lift_status[-1]
-                        if last_status == "ok":
-                            print(f"    lifted query: {lift_counts[-1]} rows in {lift_lat_ms[-1]} ms", flush=True)
-                        else:
-                            print(f"    lifted query: {last_status}", flush=True)
+                        # Build StageLift for this run
+                        t0 = time.perf_counter()
+                        run_write(s, BUILD_STAGE_NODES, timeout_sec=args.build_timeout)
+                        run_write(s, BUILD_STAGE_EDGES, timeout_sec=args.build_timeout)
+                        lifted_build_ms_run = round(
+                            (time.perf_counter() - t0) * 1000.0, 3
+                        )
+                        lifted_build_runs.append(lifted_build_ms_run)
+                        print(f"    run {r+1}: lifted build {lifted_build_ms_run} ms", flush=True)
 
-                    # Per-run sanity
-                    if (b_rows is not None) and (l_rows is not None):
-                        sanity_equal_counts.append(bool(b_rows == l_rows))
-                    else:
-                        sanity_equal_counts.append(None)
+                        # Baseline query
+                        b_rows: Optional[int] = None
+                        try:
+                            rows, elapsed = run_count_with_latency(
+                                args.uri, args.user, args.password, args.database,
+                                BASELINE_COUNT, timeout_sec=args.timeout
+                            )
+                            base_successes += 1
+                            base_lat_ms.append(round(elapsed * 1000.0, 3))
+                            base_counts.append(int(rows))
+                            base_status.append("ok")
+                            b_rows = int(rows)
+                        except Neo4jError as e:
+                            if is_timeout_error(e) or getattr(e, "args", [None])[0] == "ClientEnforcedTimeout":
+                                base_timeouts += 1
+                                base_lat_ms.append("")
+                                base_counts.append("")
+                                base_status.append("timeout")
+                            else:
+                                raise
+
+                        # Print baseline query latency/status for this run
+                        if base_status:
+                            last_status = base_status[-1]
+                            if last_status == "ok":
+                                print(f"    baseline query: {base_counts[-1]} rows in {base_lat_ms[-1]} ms", flush=True)
+                            else:
+                                print(f"    baseline query: {last_status}", flush=True)
+
+                        # Lifted query
+                        l_rows: Optional[int] = None
+                        try:
+                            rows, elapsed = run_count_with_latency(
+                                args.uri, args.user, args.password, args.database,
+                                LIFTED_COUNT, timeout_sec=args.lift_timeout
+                            )
+                            lift_successes += 1
+                            lift_lat_ms.append(round(elapsed * 1000.0, 3))
+                            lift_counts.append(int(rows))
+                            lift_status.append("ok")
+                            l_rows = int(rows)
+                        except Neo4jError as e:
+                            if is_timeout_error(e) or getattr(e, "args", [None])[0] == "ClientEnforcedTimeout":
+                                lift_timeouts += 1
+                                lift_lat_ms.append("")
+                                lift_counts.append("")
+                                lift_status.append("timeout")
+                            else:
+                                raise
+
+                        # Print lifted query latency/status for this run
+                        if lift_status:
+                            last_status = lift_status[-1]
+                            if last_status == "ok":
+                                print(f"    lifted query: {lift_counts[-1]} rows in {lift_lat_ms[-1]} ms", flush=True)
+                            else:
+                                print(f"    lifted query: {last_status}", flush=True)
+
+                        # Per-run sanity
+                        if (b_rows is not None) and (l_rows is not None):
+                            sanity_equal_counts.append(bool(b_rows == l_rows))
+                        else:
+                            sanity_equal_counts.append(None)
 
             # Aggregate per-E
             baseline_build_ms = (
@@ -566,6 +568,8 @@ def main():
             sanity_mismatch_runs = sum(1 for x in sanity_equal_counts if x is False)
 
             results.append({
+                "nodes": N,
+                "density": D,
                 "edges": E,
                 "runs": args.repeats,
 
@@ -593,7 +597,7 @@ def main():
 
     # Write CSV
     fieldnames = [
-        "edges", "runs",
+        "nodes", "density", "edges", "runs",
         "baseline_build_ms", "lifted_build_ms",
         "baseline_timeouts", "baseline_successes", "baseline_avg_latency_ms",
         "baseline_run_latencies_ms", "baseline_run_counts", "baseline_run_statuses",
@@ -613,7 +617,7 @@ def main():
         
         for result in results:
             edges = result["edges"]
-            nodes = args.accounts
+            nodes = result["nodes"]
             baseline_build = result["baseline_build_ms"]
             lifted_build = result["lifted_build_ms"]
             baseline_latency = result["baseline_avg_latency_ms"]
