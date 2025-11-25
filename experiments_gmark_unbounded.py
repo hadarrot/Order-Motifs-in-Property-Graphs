@@ -5,8 +5,8 @@ experiments_gmark_unbounded_rebuild.py
 - Base graph is generated with gMark.
 - For each run: generate fresh graph, load, build StageLift, run queries.
 - Writes TWO output files incrementally:
-  1. *_details.csv: Full details with JSON arrays.
-  2. *_summary.csv: Clean summary with Speedup calculation.
+  1. *_details.csv: Full details with JSON arrays. "timeout" used for timeouts.
+  2. *_summary.csv: Clean summary. "N/A" used for missing averages.
 """
 
 import argparse
@@ -282,7 +282,6 @@ def main():
     # Initialize Headers for BOTH files
     # ---------------------------------------------------------
     
-    # 1. Details File Header
     details_fields = [
         "nodes", "density", "edges", "runs",
         "baseline_build_ms", "lifted_build_ms",
@@ -298,7 +297,6 @@ def main():
         writer.writeheader()
         f.flush()
 
-    # 2. Summary File Header
     summary_fields = [
         "Nodes", "Edges", 
         "Baseline Build (ms)", "Lifted Build (ms)", 
@@ -367,8 +365,8 @@ def main():
                         except Neo4jError as e:
                             if is_timeout_error(e) or getattr(e, "args", [None])[0] == "ClientEnforcedTimeout":
                                 base_timeouts += 1
-                                base_lat_ms.append("")
-                                base_counts.append("")
+                                base_lat_ms.append("timeout")  # <-- Changed from "" to "timeout"
+                                base_counts.append("timeout")
                                 base_status.append("timeout")
                             else: raise
 
@@ -384,8 +382,8 @@ def main():
                         except Neo4jError as e:
                             if is_timeout_error(e) or getattr(e, "args", [None])[0] == "ClientEnforcedTimeout":
                                 lift_timeouts += 1
-                                lift_lat_ms.append("")
-                                lift_counts.append("")
+                                lift_lat_ms.append("timeout")  # <-- Changed from "" to "timeout"
+                                lift_counts.append("timeout")
                                 lift_status.append("timeout")
                             else: raise
 
@@ -396,25 +394,39 @@ def main():
                             sanity_equal_counts.append(None)
 
                 # --- Aggregation ---
-                baseline_build_ms = round(sum(baseline_build_runs) / len(baseline_build_runs), 3) if baseline_build_runs else ""
-                lifted_build_ms = round(sum(lifted_build_runs) / len(lifted_build_runs), 3) if lifted_build_runs else ""
+                # 1. Builds
+                baseline_build_ms = round(sum(baseline_build_runs) / len(baseline_build_runs), 3) if baseline_build_runs else 0
+                lifted_build_ms = round(sum(lifted_build_runs) / len(lifted_build_runs), 3) if lifted_build_runs else 0
 
+                # 2. Baseline Avg (Numerical for calc, String for display)
                 base_ok_lat = [x for x in base_lat_ms if isinstance(x, (int, float))]
-                base_avg_ms = round(sum(base_ok_lat) / len(base_ok_lat), 3) if base_ok_lat else ""
+                if base_ok_lat:
+                    base_avg_num = sum(base_ok_lat) / len(base_ok_lat)
+                    base_avg_details = round(base_avg_num, 3)
+                    base_avg_summary = round(base_avg_num, 3)
+                else:
+                    base_avg_num = None
+                    base_avg_details = "timeout"   # Details: "timeout"
+                    base_avg_summary = "N/A"  # Summary: "N/A"
 
+                # 3. Lifted Avg
                 lift_ok_lat = [x for x in lift_lat_ms if isinstance(x, (int, float))]
-                lift_avg_ms = round(sum(lift_ok_lat) / len(lift_ok_lat), 3) if lift_ok_lat else ""
+                if lift_ok_lat:
+                    lift_avg_num = sum(lift_ok_lat) / len(lift_ok_lat)
+                    lift_avg_details = round(lift_avg_num, 3)
+                    lift_avg_summary = round(lift_avg_num, 3)
+                else:
+                    lift_avg_num = None
+                    lift_avg_details = "timeout"
+                    lift_avg_summary = "N/A"
 
                 # --- Calculate Speedup ---
                 # Speedup = (Baseline Avg Query) / (Lifted Build + Lifted Avg Query)
-                speedup = ""
-                if isinstance(base_avg_ms, (int, float)) and \
-                   isinstance(lift_avg_ms, (int, float)) and \
-                   isinstance(lifted_build_ms, (int, float)):
-                    
-                    total_lifted_cost = lifted_build_ms + lift_avg_ms
+                speedup = "N/A"
+                if (base_avg_num is not None) and (lift_avg_num is not None):
+                    total_lifted_cost = lifted_build_ms + lift_avg_num
                     if total_lifted_cost > 0:
-                        speedup = round(base_avg_ms / total_lifted_cost, 3)
+                        speedup = round(base_avg_num / total_lifted_cost, 3)
 
                 # --- Write Details Row ---
                 detail_row = {
@@ -425,13 +437,13 @@ def main():
                     "lifted_build_runs_ms": json.dumps(lifted_build_runs),
                     "baseline_timeouts": base_timeouts,
                     "baseline_successes": base_successes,
-                    "baseline_avg_latency_ms": base_avg_ms,
+                    "baseline_avg_latency_ms": base_avg_details, # Uses "timeout" if null
                     "baseline_run_latencies_ms": json.dumps(base_lat_ms),
                     "baseline_run_counts": json.dumps(base_counts),
                     "baseline_run_statuses": json.dumps(base_status),
                     "lift_timeouts": lift_timeouts,
                     "lift_successes": lift_successes,
-                    "lift_avg_latency_ms": lift_avg_ms,
+                    "lift_avg_latency_ms": lift_avg_details,    # Uses "timeout" if null
                     "lift_run_latencies_ms": json.dumps(lift_lat_ms),
                     "lift_run_counts": json.dumps(lift_counts),
                     "lift_run_statuses": json.dumps(lift_status),
@@ -452,8 +464,8 @@ def main():
                     "Edges": E,
                     "Baseline Build (ms)": baseline_build_ms,
                     "Lifted Build (ms)": lifted_build_ms,
-                    "Baseline Avg Latency (ms)": base_avg_ms,
-                    "Lifted Avg Latency (ms)": lift_avg_ms,
+                    "Baseline Avg Latency (ms)": base_avg_summary, # Uses "N/A" if null
+                    "Lifted Avg Latency (ms)": lift_avg_summary,   # Uses "N/A" if null
                     "Speedup": speedup
                 }
 
