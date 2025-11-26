@@ -33,6 +33,9 @@ except ImportError:
     print("tqdm not found. Install with `pip install tqdm` for progress bars.")
     def tqdm(iterable, desc=None, leave=True):
         return iterable
+    
+
+# python3 experiments_gmark_unbounded.py --password ItayBachar88 --accounts 100000 200000  --densities 1.0 5.0 10.0 --out results.csv
 
 # ----------------------------
 # Cypher fragments
