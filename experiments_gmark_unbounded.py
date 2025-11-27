@@ -262,14 +262,16 @@ def main():
     ap.add_argument("--gmark_dir", default="gmark")
     ap.add_argument("--gmark_schema", default="shop.xml")
     ap.add_argument("--tmp_dir", default="/tmp")
-    ap.add_argument("--out", default="experiment_results.csv")
+    ap.add_argument("--out", default="results/experiment_results.csv")
 
     args = ap.parse_args()
     if args.lift_timeout is None: args.lift_timeout = args.timeout
 
     # Timestamp output
     ts = time.strftime("%Y%m%d-%H%M%S")
-    p = Path(args.out)
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True) # Create the results/ directory
+    p = out_path
     base_name = f"{p.stem}_{ts}"
     
     # Define TWO output files
