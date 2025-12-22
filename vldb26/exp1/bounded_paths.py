@@ -14,7 +14,7 @@ from pathlib import Path
 from neo4j import GraphDatabase
 from neo4j.exceptions import Neo4jError
 
-# python3 ./bounded_paths.py --password "ItayBachar88" --nodes 100 1000 10000 100000 1000000 100000
+# python3 ./bounded_paths.py --password "ItayBachar88" --nodes 100 1000 10000 100000 1000000 
 # -----------------------------------------------------------------------------
 # Configuration Constants
 # -----------------------------------------------------------------------------
