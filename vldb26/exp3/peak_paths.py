@@ -348,17 +348,24 @@ def append_result_row(filename, r):
         ("Speedup", 8), ("Sanity", 8)
     ]
     fmt = "  ".join([f"{{:<{w}}}" for _, w in HEADERS])
+    
+    # Handle Speedup formatting (string "x" vs float)
+    speedup_val = r["speedup"]
+    if isinstance(speedup_val, str):
+        speedup_str = speedup_val
+    else:
+        speedup_str = f"{speedup_val:.2f}"
+
     line = fmt.format(
         r["nodes"], r["density"], r["edges"], str(r["hops"]),
         f"{r['base_mean']:.2f}", f"{r['base_std']:.2f}", r['base_timeouts'], f"{r['base_paths']:.1f}",
         f"{r['build_avg']:.2f}",
         f"{r['lift_mean']:.2f}", f"{r['lift_std']:.2f}", r['lift_timeouts'], f"{r['lift_paths']:.1f}",
-        f"{r['speedup']:.2f}",
+        speedup_str,
         r["sanity"]
     )
     with open(filename, "a") as f:
         f.write(line + "\n")
-
 def main():
     global DEBUG
     
@@ -366,7 +373,7 @@ def main():
     parser.add_argument("--uri", default="bolt://127.0.0.1:7687")
     parser.add_argument("--user", default="neo4j")
     parser.add_argument("--password", required=True)
-    parser.add_argument("--database", default="neo4j", help="Name of the database")
+    parser.add_argument("--database", default="neo4j2", help="Name of the database")
     parser.add_argument("--densities", type=float, nargs="+", default=[1.0, 5.0, 10.0])
     parser.add_argument("--hops", type=int, nargs="+", default=[2,4,8,16,32,64])
     parser.add_argument("--nodes", type=int, nargs="+", default=[1000])
@@ -516,15 +523,23 @@ def main():
                 l_mean, l_std = get_stats(data["lift"])
                 build_avg = statistics.mean(data["build"]) if data["build"] else 0.0
                 
-                # Calculate average paths (from successful runs only)
                 base_paths_avg = statistics.mean(data["base_counts"]) if data["base_counts"] else 0.0
                 lift_paths_avg = statistics.mean(data["lift_counts"]) if data["lift_counts"] else 0.0
 
                 denominator = build_avg + l_mean
                 
-                if len(data["base"]) == 0 and data["base_to"] > 0 and denominator > 0:
+                # Check for Timeout conditions
+                base_timed_out = (len(data["base"]) == 0 and data["base_to"] > 0)
+                lift_timed_out = (len(data["lift"]) == 0 and data["lift_to"] > 0)
+
+                if base_timed_out and lift_timed_out:
+                    # BOTH timed out -> "x"
+                    speedup = "x"
+                elif base_timed_out and denominator > 0:
+                    # Only Base timed out -> "inf"
                     speedup = float('inf')
                 elif denominator > 0:
+                    # Normal calculation
                     speedup = b_mean / denominator
                 else:
                     speedup = 0.0
@@ -533,6 +548,12 @@ def main():
                 elif data["sanity_verified_count"] > 0: sanity_str = "PASS"
                 else: sanity_str = "N/A"
 
+                # FIX: Handle formatting for console print just like we did for the file
+                if isinstance(speedup, str):
+                    speedup_str = speedup
+                else:
+                    speedup_str = f"{speedup:.2f}"
+
                 row = {
                     "nodes": N, "density": D, "edges": E, "hops": H,
                     "base_mean": b_mean, "base_std": b_std, "base_timeouts": data["base_to"],
@@ -540,11 +561,13 @@ def main():
                     "build_avg": build_avg,
                     "lift_mean": l_mean, "lift_std": l_std, "lift_timeouts": data["lift_to"],
                     "lift_paths": lift_paths_avg,
-                    "speedup": speedup,
+                    "speedup": speedup,  # Pass raw value (str or float) to append_result_row
                     "sanity": sanity_str
                 }
                 append_result_row(final_output_file, row)
-                print(f"  Hops={H} | Base={b_mean:.2f}ms ({base_paths_avg:.0f} paths) | Lift={l_mean:.2f}ms ({lift_paths_avg:.0f} paths) | Speedup={speedup:.2f}x")
+                
+                # Updated Print Statement using speedup_str
+                print(f"  Hops={H} | Base={b_mean:.2f}ms ({base_paths_avg:.0f} paths) | Lift={l_mean:.2f}ms ({lift_paths_avg:.0f} paths) | Speedup={speedup_str}x")
 
             driver.close()
 
