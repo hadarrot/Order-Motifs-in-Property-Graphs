@@ -154,11 +154,13 @@ CALL(){{
   MATCH (start:Stage {{level: -1, layer: 1}})
   MATCH p = (start)-[:TRANSFER_LIFT{range_str}]->(x:Stage {{layer: {motif_len}}})
   WHERE NOT ANY(r1 IN relationships(p) WHERE size([r2 IN relationships(p) WHERE r2.eid = r1.eid]) > 1)
-  RETURN 1 AS row
+  
+  // FIX: Extract original Edge IDs and deduplicate based on the physical path
+  WITH [r IN relationships(p) | r.eid] AS path_eids
+  RETURN DISTINCT path_eids
 }}
 RETURN count(*) AS rows
 """
-
 # -----------------------------------------------------------------------------
 # Standard Infrastructure
 # -----------------------------------------------------------------------------
@@ -367,7 +369,7 @@ def main():
     parser.add_argument("--user", default="neo4j")
     parser.add_argument("--password", required=True)
     parser.add_argument("--database", default="neo4j")
-    parser.add_argument("--densities", type=float, nargs="+", default=[1.0, 5.0])
+    parser.add_argument("--densities", type=float, nargs="+", default=[1.0, 5.0, 10.0])
     parser.add_argument("--nodes", type=int, nargs="+", default=[10000])
     parser.add_argument("--hops", type=int, nargs="+", default=[2,4,8,16,32,64])
     parser.add_argument("--test_mode", choices=["zigzag", "wildcard"], default="zigzag")
