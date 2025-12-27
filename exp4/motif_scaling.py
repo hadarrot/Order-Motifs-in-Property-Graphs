@@ -403,7 +403,7 @@ def main():
             m = (base * 3)[:k]
             motifs_to_test.append("".join(m))
     elif args.test_mode == "wildcard":
-        motifs_to_test = ["UDU", "U*U", "*D*", "***"]
+        motifs_to_test = ["UDU", "U*U", "*D*"]
 
     for N in args.nodes:
         print(f"\n=== PROCESSING NODE COUNT: {N} ===")
