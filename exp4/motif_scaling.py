@@ -434,6 +434,10 @@ def main():
                         with driver.session(database=args.database) as session:
                             _, lift_ms = build_infrastructure(session, csv_path, motif)
                         
+                        # --- NEW LOGIC: RESET CONSECUTIVE FAILURE COUNTERS FOR EACH REPEAT ---
+                        consecutive_base_to = 0
+                        consecutive_lift_to = 0
+
                         for H in configs:
                             h_label = f"Unbounded" if H == "inf" else f"Hops={H}"
                             
@@ -441,29 +445,39 @@ def main():
                             q_base = generate_native_query(motif, str(H))
                             q_lift = make_lifted_query_final(len(motif), str(H))
 
+                            # --- BASE QUERY ---
                             val_b = -1
-                            if experiment_data[H]["base_to"] >= 2:
+                            # Check consecutive failures in this run
+                            if consecutive_base_to >= 2:
                                 experiment_data[H]["base_to"] += 1
+                                # Skipped due to previous consecutive failures
                             else:
                                 try:
                                     val, t_sec = run_timed_query(args.uri, auth, q_base, args.timeout, args.database)
                                     experiment_data[H]["base"].append(t_sec * 1000)
                                     experiment_data[H]["base_counts"].append(val)
                                     val_b = val
+                                    consecutive_base_to = 0  # Success resets counter
                                 except TimeoutError:
                                     experiment_data[H]["base_to"] += 1
+                                    consecutive_base_to += 1 # Failure increments counter
                             
+                            # --- LIFT QUERY ---
                             val_l = -1
-                            if experiment_data[H]["lift_to"] >= 2:
+                            # Check consecutive failures in this run
+                            if consecutive_lift_to >= 2:
                                 experiment_data[H]["lift_to"] += 1
+                                # Skipped due to previous consecutive failures
                             else:
                                 try:
                                     val, t_sec = run_timed_query(args.uri, auth, q_lift, args.timeout, args.database)
                                     experiment_data[H]["lift"].append(t_sec * 1000)
                                     experiment_data[H]["lift_counts"].append(val)
                                     val_l = val
+                                    consecutive_lift_to = 0  # Success resets counter
                                 except TimeoutError:
                                     experiment_data[H]["lift_to"] += 1
+                                    consecutive_lift_to += 1 # Failure increments counter
 
                             if val_b >= 0 and val_l >= 0:
                                 if val_b == val_l:
