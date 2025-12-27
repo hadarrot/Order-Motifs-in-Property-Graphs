@@ -495,6 +495,7 @@ def main():
                         try: os.remove(csv_path)
                         except: pass
 
+
                 print(f"--- Summary for Motif={motif} ---")
                 for H in configs:
                     data = experiment_data[H]
@@ -512,11 +513,22 @@ def main():
                     speedup = "x"
                     base_failed = (data["base_to"] == args.repeats)
                     lift_failed = (data["lift_to"] == args.repeats)
+                    
+                    # --- NEW LOGIC START ---
+                    # Check if build exceeded the query timeout budget (convert args.timeout to ms)
+                    build_over_budget = build_avg > (args.timeout * 1000)
 
-                    if base_failed and lift_failed: speedup = "x"
-                    elif base_failed: speedup = float('inf')
-                    elif denom > 0: speedup = b_mean / denom
-                    else: speedup = 0.0
+                    if base_failed and lift_failed and build_over_budget:
+                        speedup = "TIME OUT"  # Specific override for high build time + double query failure
+                    elif base_failed and lift_failed: 
+                        speedup = "x"
+                    elif base_failed: 
+                        speedup = float('inf')
+                    elif denom > 0: 
+                        speedup = b_mean / denom
+                    else: 
+                        speedup = 0.0
+                    # --- NEW LOGIC END ---
 
                     sanity = "FAIL" if data["sanity_mismatch"] else ("PASS" if data["sanity_verified_count"] > 0 else "N/A")
 
