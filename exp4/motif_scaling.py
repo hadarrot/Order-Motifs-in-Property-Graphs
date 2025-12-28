@@ -258,7 +258,7 @@ def load_graph_to_neo4j(session, csv_path):
         batch = edges[i:i + LOAD_BATCH_SIZE]
         run_write(session, LOAD_EDGES, {"rows": batch})
 
-def build_infrastructure(session, csv_path, motif_str):
+def build_infrastructure(session, csv_path, motif_str, timeout_sec):
     debug_print(f"\n[DEBUG] --- STARTING INFRASTRUCTURE BUILD (Motif: {motif_str}) ---")
     clear_database(session)
     for i, stmt in enumerate(INIT_CONSTRAINTS): run_write(session, stmt)
@@ -269,30 +269,38 @@ def build_infrastructure(session, csv_path, motif_str):
     debug_print(f"[DEBUG] Base Graph Load Complete. Time: {base_ms:.2f}ms")
 
     debug_print("\n[DEBUG] --- STARTING LIFTED GRAPH GENERATION ---")
-    t_start = time.perf_counter()
+    
+    # Reset timer for lift phase check
+    lift_start_t = time.perf_counter()
     
     result = session.run(GET_ALL_ACCOUNTS)
     all_ids = [record["id"] for record in result]
     total_ids = len(all_ids)
     
     q_nodes = generate_build_nodes_query(len(motif_str))
-    # UPDATED: Get list of queries
     edge_queries = generate_build_edges_queries_list(motif_str)
 
     debug_print(f"[DEBUG] Building Stage Nodes...")
-    for i in range(0, total_ids, LIFT_BATCH_SIZE):
-        batch_ids = all_ids[i:i + LIFT_BATCH_SIZE]
-        run_write(session, q_nodes, {"batchIds": batch_ids})
-
-    debug_print(f"[DEBUG] Building Stage Edges ({len(edge_queries)} steps)...")
-    # Run each edge query independently
-    for q_idx, q_edge in enumerate(edge_queries):
-        # debug_print(f"  > Running Edge Pass {q_idx+1}/{len(edge_queries)}...")
+    try:
         for i in range(0, total_ids, LIFT_BATCH_SIZE):
+            if (time.perf_counter() - lift_start_t) > timeout_sec:
+                raise TimeoutError
             batch_ids = all_ids[i:i + LIFT_BATCH_SIZE]
-            run_write(session, q_edge, {"batchIds": batch_ids})
+            run_write(session, q_nodes, {"batchIds": batch_ids})
+
+        debug_print(f"[DEBUG] Building Stage Edges ({len(edge_queries)} steps)...")
+        for q_idx, q_edge in enumerate(edge_queries):
+            for i in range(0, total_ids, LIFT_BATCH_SIZE):
+                if (time.perf_counter() - lift_start_t) > timeout_sec:
+                    raise TimeoutError
+                batch_ids = all_ids[i:i + LIFT_BATCH_SIZE]
+                run_write(session, q_edge, {"batchIds": batch_ids})
     
-    lift_ms = (time.perf_counter() - t_start) * 1000
+    except TimeoutError:
+        debug_print(f"[DEBUG] Lifted Graph Build TIMED OUT (> {timeout_sec}s). Continuing with Base only.")
+        return base_ms, -1  # Return -1 to signal lift failure
+
+    lift_ms = (time.perf_counter() - lift_start_t) * 1000
     debug_print(f"[DEBUG] Lifted Graph Build Complete. Time: {lift_ms:.2f}ms")
     return base_ms, lift_ms
 
@@ -403,7 +411,9 @@ def main():
             m = (base * 3)[:k]
             motifs_to_test.append("".join(m))
     elif args.test_mode == "wildcard":
-        motifs_to_test = ["UDU", "U*U", "*D*"]
+        # motifs_to_test = ["UDU", "U*U", "*D*"]
+        motifs_to_test = ["*D*"]
+
 
     for N in args.nodes:
         print(f"\n=== PROCESSING NODE COUNT: {N} ===")
@@ -432,53 +442,61 @@ def main():
                     try:
                         driver = GraphDatabase.driver(args.uri, auth=auth)
                         with driver.session(database=args.database) as session:
-                            _, lift_ms = build_infrastructure(session, csv_path, motif)
+                            # PASSING ARGS.TIMEOUT
+                            _, lift_ms = build_infrastructure(session, csv_path, motif, args.timeout)
                         
-                        # --- NEW LOGIC: RESET CONSECUTIVE FAILURE COUNTERS FOR EACH REPEAT ---
+                        # Handle Lift Timeout: If -1, we mark as timeout and skip lift queries
+                        lift_failed = (lift_ms == -1)
+
                         consecutive_base_to = 0
                         consecutive_lift_to = 0
 
                         for H in configs:
                             h_label = f"Unbounded" if H == "inf" else f"Hops={H}"
                             
-                            experiment_data[H]["build"].append(lift_ms)
+                            # Only record build time if it succeeded
+                            if not lift_failed:
+                                experiment_data[H]["build"].append(lift_ms)
+                            else:
+                                experiment_data[H]["lift_to"] += 1
+
                             q_base = generate_native_query(motif, str(H))
                             q_lift = make_lifted_query_final(len(motif), str(H))
 
-                            # --- BASE QUERY ---
+                            # --- BASE QUERY (ALWAYS RUN) ---
                             val_b = -1
-                            # Check consecutive failures in this run
                             if consecutive_base_to >= 2:
                                 experiment_data[H]["base_to"] += 1
-                                # Skipped due to previous consecutive failures
                             else:
                                 try:
                                     val, t_sec = run_timed_query(args.uri, auth, q_base, args.timeout, args.database)
                                     experiment_data[H]["base"].append(t_sec * 1000)
                                     experiment_data[H]["base_counts"].append(val)
                                     val_b = val
-                                    consecutive_base_to = 0  # Success resets counter
+                                    consecutive_base_to = 0 
                                 except TimeoutError:
                                     experiment_data[H]["base_to"] += 1
-                                    consecutive_base_to += 1 # Failure increments counter
+                                    consecutive_base_to += 1
                             
-                            # --- LIFT QUERY ---
+                            # --- LIFT QUERY (ONLY RUN IF BUILD SUCCEEDED) ---
                             val_l = -1
-                            # Check consecutive failures in this run
-                            if consecutive_lift_to >= 2:
+                            if lift_failed:
+                                # Counted as timeout/fail in experiment_data already or just skipped
+                                pass
+                            elif consecutive_lift_to >= 2:
                                 experiment_data[H]["lift_to"] += 1
-                                # Skipped due to previous consecutive failures
                             else:
                                 try:
                                     val, t_sec = run_timed_query(args.uri, auth, q_lift, args.timeout, args.database)
                                     experiment_data[H]["lift"].append(t_sec * 1000)
                                     experiment_data[H]["lift_counts"].append(val)
                                     val_l = val
-                                    consecutive_lift_to = 0  # Success resets counter
+                                    consecutive_lift_to = 0 
                                 except TimeoutError:
                                     experiment_data[H]["lift_to"] += 1
-                                    consecutive_lift_to += 1 # Failure increments counter
+                                    consecutive_lift_to += 1
 
+                            # Sanity only if both ran
                             if val_b >= 0 and val_l >= 0:
                                 if val_b == val_l:
                                     experiment_data[H]["sanity_verified_count"] += 1
@@ -514,13 +532,8 @@ def main():
                     base_failed = (data["base_to"] == args.repeats)
                     lift_failed = (data["lift_to"] == args.repeats)
                     
-                    # --- NEW LOGIC START ---
-                    # Check if build exceeded the query timeout budget (convert args.timeout to ms)
-                    build_over_budget = build_avg > (args.timeout * 1000)
-
-                    if base_failed and lift_failed and build_over_budget:
-                        speedup = "TIME OUT"  # Specific override for high build time + double query failure
-                    elif base_failed and lift_failed: 
+                    # Logic: If all lifts failed (timeouts or build fails)
+                    if base_failed and lift_failed: 
                         speedup = "x"
                     elif base_failed: 
                         speedup = float('inf')
@@ -528,7 +541,6 @@ def main():
                         speedup = b_mean / denom
                     else: 
                         speedup = 0.0
-                    # --- NEW LOGIC END ---
 
                     sanity = "FAIL" if data["sanity_mismatch"] else ("PASS" if data["sanity_verified_count"] > 0 else "N/A")
 
