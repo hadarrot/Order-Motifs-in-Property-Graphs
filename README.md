@@ -14,4 +14,5 @@ We evaluate compiling order-aware path constraints into plain **reachability** u
 ## Requirements
 - Neo4j reachable via Bolt
 - Python 3.10+
+- gMark binary at <GMARK_DIR>/src/test (default --gmark_dir ../gmark)
 
