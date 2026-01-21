@@ -14,8 +14,8 @@ from pathlib import Path
 from neo4j import GraphDatabase
 from neo4j.exceptions import Neo4jError
 
-# python3 motif_scaling.py --password "ItayBachar88" --nodes 10000 --test_mode zigzag --debug
-# python3 motif_scaling.py --password "ItayBachar88" --nodes 10000 --test_mode wildcard --debug
+# python3 motif_scaling.py --password "ItayBachar88" --nodes 10000 --debug
+
 # -----------------------------------------------------------------------------
 # Global Debug Control
 # -----------------------------------------------------------------------------
@@ -33,6 +33,7 @@ SETUP_TIMEOUT_SEC = 1800.0
 LOAD_BATCH_SIZE = 50000    
 LIFT_BATCH_SIZE = 1000     
 DELETE_BATCH_SIZE = 10000  
+ITERATIVE_BATCH_SIZE = 2000
 
 # -----------------------------------------------------------------------------
 # Dynamic Cypher Generators
@@ -41,9 +42,9 @@ DELETE_BATCH_SIZE = 10000
 def get_operator(char_code):
     if char_code == 'U': return "<", "UP"
     if char_code == 'D': return ">", "DOWN"
-    if char_code == '*': return None, "ANY"
     raise ValueError(f"Unknown motif char: {char_code}")
 
+# --- GLOBAL BUILD QUERIES (Legacy/Unbounded) ---
 def generate_build_nodes_query(motif_len):
     layers = list(range(1, motif_len + 1))
     return f"""
@@ -58,60 +59,109 @@ MERGE (:Stage {{accId: v.id, level: level, layer: layer}})
 """
 
 def generate_build_edges_queries_list(motif_str):
-    """
-    Returns a LIST of independent Cypher queries.
-    This prevents 'MATCH failure' in one layer from killing the row for others.
-    """
     queries = []
-    
-    # Common preamble for all edge queries
     preamble = """
 UNWIND $batchIds AS aid
 MATCH (u:Account {id: aid})-[e:TRANSFER]->(v:Account)
-WITH u, v, e, e.amount AS j, e.ts AS ts, elementId(e) as eid
+WITH u, v, e, e.amount AS j, e.ts AS ts
 """
-    
     for i, char in enumerate(motif_str):
         layer = i + 1
         op, name = get_operator(char)
         
-        # --- Query A: Intra-Motif Logic for Layer i ---
-        intra_pred = f"s_u.level {op} j" if op else "true"
+        # Intra-Motif Logic
+        intra_pred = f"s_u.level {op} j"
         q_intra = preamble + f"""
         MATCH (s_u:Stage {{accId: u.id, layer: {layer}}})
         WHERE {intra_pred}
         MATCH (s_v:Stage {{accId: v.id, level: j, layer: {layer}}})
-        MERGE (s_u)-[r:TRANSFER_LIFT {{amount: j}}]->(s_v)
-          ON CREATE SET r.ts = ts, r.eid = eid
+        MERGE (s_u)-[r:TRANSFER_LIFT]->(s_v)
+          ON CREATE SET r.amount = j, r.ts = ts
         """
         queries.append(q_intra)
 
-        # --- Query B: Switching Logic (Layer i -> i+1) ---
+        # Switching Logic
         if layer < len(motif_str):
-            next_op, next_name = get_operator(motif_str[layer])
+            next_op, _ = get_operator(motif_str[layer]) 
             next_layer = layer + 1
-            # Prevent switching from the Dummy Start Node (-1) directly
-            switch_pred = f"s_u.level {next_op} j" if next_op else "true"
+            switch_pred = f"s_u.level {next_op} j"
             
             q_switch = preamble + f"""
             MATCH (s_u:Stage {{accId: u.id, layer: {layer}}})
             WHERE s_u.level <> -1 AND {switch_pred} 
             MATCH (s_v:Stage {{accId: v.id, level: j, layer: {next_layer}}})
-            MERGE (s_u)-[r:TRANSFER_LIFT {{amount: j}}]->(s_v)
-              ON CREATE SET r.ts = ts, r.eid = eid
+            MERGE (s_u)-[r:TRANSFER_LIFT]->(s_v)
+              ON CREATE SET r.amount = j, r.ts = ts
             """
             queries.append(q_switch)
-            
     return queries
 
+# --- ITERATIVE BUILD QUERIES (Leveled Optimization) ---
+INIT_ITERATIVE_ROOTS = """
+UNWIND $batchIds AS aid
+MATCH (a:Account {id: aid})
+MERGE (s:Stage {accId: a.id, level: -1, layer: 1})
+ON CREATE SET s.active = 0
+ON MATCH SET s.active = 0
+"""
+
+GET_ACTIVE_STAGE_IDS = "MATCH (s:Stage) WHERE s.active = $step RETURN elementId(s) as id"
+
+def generate_iterative_expansion_query(motif_str):
+    """
+    Standard Iterative Expansion.
+    """
+    query = """
+UNWIND $batchIds AS sid
+MATCH (u:Stage) WHERE elementId(u) = sid
+MATCH (u_acc:Account {id: u.accId})-[e:TRANSFER]->(v_acc:Account)
+WITH u, v_acc, e, e.amount as j, $next_step as next_s
+"""
+    
+    for i, char in enumerate(motif_str):
+        layer = i + 1
+        op, _ = get_operator(char)
+        
+        # 1. Intra-Layer Expansion
+        pred_intra = f"u.layer = {layer} AND u.level {op} j"
+        
+        query += f"""
+FOREACH (_ IN CASE WHEN {pred_intra} THEN [1] ELSE [] END |
+    MERGE (v{layer}:Stage {{accId: v_acc.id, level: j, layer: {layer}}})
+    ON CREATE SET v{layer}.active = next_s
+    ON MATCH SET v{layer}.active = next_s
+    MERGE (u)-[r{layer}:TRANSFER_LIFT]->(v{layer})
+    ON CREATE SET r{layer}.amount = j, r{layer}.ts = e.ts
+)
+"""
+        # 2. Switching Expansion
+        if layer < len(motif_str):
+            next_char = motif_str[layer] 
+            next_op, _ = get_operator(next_char)
+            next_layer = layer + 1
+            pred_switch = f"u.layer = {layer} AND u.level <> -1 AND u.level {next_op} j"
+            
+            query += f"""
+FOREACH (_ IN CASE WHEN {pred_switch} THEN [1] ELSE [] END |
+    MERGE (v{next_layer}_sw:Stage {{accId: v_acc.id, level: j, layer: {next_layer}}})
+    ON CREATE SET v{next_layer}_sw.active = next_s
+    ON MATCH SET v{next_layer}_sw.active = next_s
+    MERGE (u)-[r{next_layer}_sw:TRANSFER_LIFT]->(v{next_layer}_sw)
+    ON CREATE SET r{next_layer}_sw.amount = j, r{next_layer}_sw.ts = e.ts
+)
+"""
+    return query
+
+# --- QUERIES ---
+
 def generate_native_query(motif_str, max_hops_str):
-    # Native query that correctly accounts for transitions
+    """
+    Baseline Query: Counts REACHABLE END NODES (DISTINCT t.id).
+    """
     range_str = f"*1..{max_hops_str}" if max_hops_str != "inf" else "*"
     
     def gen_segment_pred(start_idx, end_idx, char_code):
-        # range(start+1, end-1) compares (x-1, x) strictly inside the segment
         op, _ = get_operator(char_code)
-        if op is None: return "true"
         return f"ALL(x IN range({start_idx}+1, {end_idx}-1) WHERE amts[x-1] {op} amts[x])"
 
     def build_nested_any(current_stage, start_var, total_stages):
@@ -127,10 +177,7 @@ def generate_native_query(motif_str, max_hops_str):
         
         next_char = motif_str[current_stage + 1]
         op_next, _ = get_operator(next_char)
-        # Transition check: Edge BEFORE split vs Edge AFTER split
-        # amts[end_var - 1] is the last edge of current segment
-        # amts[end_var] is the first edge of next segment
-        trans_pred = f"amts[{end_var}-1] {op_next} amts[{end_var}]" if op_next else "true"
+        trans_pred = f"amts[{end_var}-1] {op_next} amts[{end_var}]"
         
         return f"""ANY({end_var} IN range({start_var}+1, size(amts)-{remaining_stages}) 
                    WHERE {seg_pred} 
@@ -140,34 +187,46 @@ def generate_native_query(motif_str, max_hops_str):
     return f"""
 CALL(){{
   MATCH p = (s:Account)-[:TRANSFER{range_str}]->(t:Account)
-  WITH p, [r IN relationships(p) | r.amount] AS amts
+  WITH p, t, [r IN relationships(p) | r.amount] AS amts
   WHERE size(amts) >= {len(motif_str)} AND {build_nested_any(0, "0", len(motif_str))}
-  RETURN 1 AS row
+  RETURN DISTINCT t.id as tid
 }}
-RETURN count(*) AS rows
+RETURN count(tid) AS rows
 """
 
 def make_lifted_query_final(motif_len, max_hops_str):
-    range_str = f"*1..{max_hops_str}" if max_hops_str != "inf" else "*"
-    return f"""
-CALL(){{
-  MATCH (start:Stage {{level: -1, layer: 1}})
-  MATCH p = (start)-[:TRANSFER_LIFT{range_str}]->(x:Stage {{layer: {motif_len}}})
-  WHERE NOT ANY(r1 IN relationships(p) WHERE size([r2 IN relationships(p) WHERE r2.eid = r1.eid]) > 1)
-  
-  // FIX: Extract original Edge IDs and deduplicate based on the physical path
-  WITH [r IN relationships(p) | r.eid] AS path_eids
-  RETURN DISTINCT path_eids
-}}
-RETURN count(*) AS rows
-"""
+    """
+    Lifted Query: Instant Node Count (DISTINCT ACCOUNTS).
+    """
+    is_iterative = (max_hops_str != "inf" and int(max_hops_str) <= 1024)
+    
+    if is_iterative:
+        # Optimization: We built only reachable nodes. 
+        # But we must count DISTINCT accId to match Base Query semantics.
+        return f"""
+        MATCH (x:Stage {{layer: {motif_len}}}) 
+        RETURN count(DISTINCT x.accId) AS rows
+        """
+    else:
+        # Fallback for global
+        range_str = f"*1..{max_hops_str}" if max_hops_str != "inf" else "*"
+        return f"""
+        CALL(){{
+          MATCH (start:Stage {{level: -1, layer: 1}})
+          MATCH p = (start)-[:TRANSFER_LIFT{range_str}]->(x:Stage {{layer: {motif_len}}})
+          RETURN DISTINCT x.accId as tid
+        }}
+        RETURN count(tid) AS rows
+        """
+
 # -----------------------------------------------------------------------------
-# Standard Infrastructure
+# Infrastructure & Utils
 # -----------------------------------------------------------------------------
 
 INIT_CONSTRAINTS = [
     "CREATE CONSTRAINT account_id IF NOT EXISTS FOR (a:Account) REQUIRE a.id IS UNIQUE",
     "CREATE INDEX stage_acc_level_layer IF NOT EXISTS FOR (s:Stage) ON (s.accId, s.level, s.layer)",
+    "CREATE INDEX stage_active IF NOT EXISTS FOR (s:Stage) ON (s.active)",
 ]
 
 LOAD_ACCOUNTS = "UNWIND $ids AS i MERGE (:Account {id: i})"
@@ -206,7 +265,6 @@ def generate_gmark_csv(n_nodes, n_edges, gmark_dir, output_dir, schema_file="sho
     update_gmark_schema(schema_path, n_edges, n_nodes)
     run_shell(["./test", "-c", f"../use-cases/{schema_file}", "-g", "../demo/play/play-graph.txt",
         "-w", "../demo/play/play-workload.xml", "-r", "../demo/play", "-n", str(n_nodes)], cwd=src_dir)
-    
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     csv_path = os.path.join(output_dir, "edges.csv")
     with open(csv_path, "w", newline="") as fout:
@@ -231,19 +289,22 @@ def run_write(session, cypher, params=None, desc="Query"):
     def work(tx): tx.run(cypher, params or {}, timeout=SETUP_TIMEOUT_SEC).consume()
     session.execute_write(work)
 
-def clear_database(session):
-    debug_print("[DEBUG] Clearing database (Batched Deletion)...")
-    total_deleted = 0
+def clear_database_full(session):
+    debug_print("[DEBUG] Clearing FULL database...")
     while True:
         query = f"MATCH (n) WITH n LIMIT {DELETE_BATCH_SIZE} DETACH DELETE n RETURN count(n) as count"
         result = session.run(query).single()
-        count = result["count"]
-        total_deleted += count
-        if count == 0: break
-    debug_print(f"[DEBUG] Database cleared. Total nodes removed: {total_deleted}")
+        if result["count"] == 0: break
 
-def load_graph_to_neo4j(session, csv_path):
-    debug_print("[DEBUG] Reading CSV for Neo4j loading...")
+def clean_lifted_graph(session):
+    debug_print("[DEBUG] Cleaning LIFTED Graph (Stages only)...")
+    while True:
+        query = f"MATCH (n:Stage) WITH n LIMIT {DELETE_BATCH_SIZE} DETACH DELETE n RETURN count(n) as count"
+        result = session.run(query).single()
+        if result["count"] == 0: break
+
+def load_base_graph(session, csv_path):
+    debug_print("[DEBUG] Reading CSV for Base Graph loading...")
     edges = []
     nodes = set()
     with open(csv_path, "r") as f:
@@ -258,54 +319,43 @@ def load_graph_to_neo4j(session, csv_path):
         batch = edges[i:i + LOAD_BATCH_SIZE]
         run_write(session, LOAD_EDGES, {"rows": batch})
 
-def build_infrastructure(session, csv_path, motif_str, timeout_sec):
-    debug_print(f"\n[DEBUG] --- STARTING INFRASTRUCTURE BUILD (Motif: {motif_str}) ---")
-    clear_database(session)
-    for i, stmt in enumerate(INIT_CONSTRAINTS): run_write(session, stmt)
-
-    t_start = time.perf_counter()
-    load_graph_to_neo4j(session, csv_path)
-    base_ms = (time.perf_counter() - t_start) * 1000
-    debug_print(f"[DEBUG] Base Graph Load Complete. Time: {base_ms:.2f}ms")
-
-    debug_print("\n[DEBUG] --- STARTING LIFTED GRAPH GENERATION ---")
-    
-    # Reset timer for lift phase check
-    lift_start_t = time.perf_counter()
-    
-    result = session.run(GET_ALL_ACCOUNTS)
-    all_ids = [record["id"] for record in result]
+def build_full_lifted_graph(session, all_ids, motif_str, timeout_sec, start_time_ref):
+    debug_print(f"[DEBUG] Strategy: GLOBAL FULL BUILD")
     total_ids = len(all_ids)
-    
     q_nodes = generate_build_nodes_query(len(motif_str))
     edge_queries = generate_build_edges_queries_list(motif_str)
-
-    debug_print(f"[DEBUG] Building Stage Nodes...")
-    try:
+    for i in range(0, total_ids, LIFT_BATCH_SIZE):
+        if (time.perf_counter() - start_time_ref) > timeout_sec: return False
+        batch_ids = all_ids[i:i + LIFT_BATCH_SIZE]
+        run_write(session, q_nodes, {"batchIds": batch_ids})
+    for q_edge in edge_queries:
         for i in range(0, total_ids, LIFT_BATCH_SIZE):
-            if (time.perf_counter() - lift_start_t) > timeout_sec:
-                raise TimeoutError
+            if (time.perf_counter() - start_time_ref) > timeout_sec: return False
             batch_ids = all_ids[i:i + LIFT_BATCH_SIZE]
-            run_write(session, q_nodes, {"batchIds": batch_ids})
+            run_write(session, q_edge, {"batchIds": batch_ids})
+    return True
 
-        debug_print(f"[DEBUG] Building Stage Edges ({len(edge_queries)} steps)...")
-        for q_idx, q_edge in enumerate(edge_queries):
-            for i in range(0, total_ids, LIFT_BATCH_SIZE):
-                if (time.perf_counter() - lift_start_t) > timeout_sec:
-                    raise TimeoutError
-                batch_ids = all_ids[i:i + LIFT_BATCH_SIZE]
-                run_write(session, q_edge, {"batchIds": batch_ids})
-    
-    except TimeoutError:
-        debug_print(f"[DEBUG] Lifted Graph Build TIMED OUT (> {timeout_sec}s). Continuing with Base only.")
-        return base_ms, -1  # Return -1 to signal lift failure
-
-    lift_ms = (time.perf_counter() - lift_start_t) * 1000
-    debug_print(f"[DEBUG] Lifted Graph Build Complete. Time: {lift_ms:.2f}ms")
-    return base_ms, lift_ms
+def build_iterative_lifted_graph(session, all_ids, motif_str, max_hops, timeout_sec, start_time_ref):
+    debug_print(f"[DEBUG] Strategy: ITERATIVE BUILD (Max Depth: {max_hops})")
+    for i in range(0, len(all_ids), LIFT_BATCH_SIZE):
+        if (time.perf_counter() - start_time_ref) > timeout_sec: return False
+        batch_ids = all_ids[i:i + LIFT_BATCH_SIZE]
+        run_write(session, INIT_ITERATIVE_ROOTS, {"batchIds": batch_ids})
+    expand_query = generate_iterative_expansion_query(motif_str)
+    for step in range(max_hops):
+        if (time.perf_counter() - start_time_ref) > timeout_sec: return False
+        res = session.run(GET_ACTIVE_STAGE_IDS, {"step": step})
+        active_ids = [r["id"] for r in res]
+        if not active_ids: break
+        debug_print(f"  [Iterative] Step {step}: Expanding {len(active_ids)} active nodes...")
+        for i in range(0, len(active_ids), ITERATIVE_BATCH_SIZE):
+            if (time.perf_counter() - start_time_ref) > timeout_sec: return False
+            batch = active_ids[i:i + ITERATIVE_BATCH_SIZE]
+            run_write(session, expand_query, {"batchIds": batch, "next_step": step + 1})
+    return True
 
 # -----------------------------------------------------------------------------
-# Worker / Main
+# Main Execution
 # -----------------------------------------------------------------------------
 
 def _worker(conn, uri, auth, cypher, database):
@@ -338,9 +388,9 @@ def run_timed_query(uri, auth, cypher, timeout, database):
 def init_results_file(filename):
     HEADERS = [
         ("Motif", 10), ("Nodes", 8), ("Density", 7), ("Hops", 5),
-        ("B.Mean(ms)", 10), ("B.Std(ms)", 10), ("B.TO", 5), ("Paths(B)", 10),
-        ("Build(ms)", 10), ("L.Mean(ms)", 10), ("L.Std(ms)", 10), ("L.TO", 5), ("Paths(L)", 10),
-        ("Speedup", 8), ("Sanity", 8)
+        ("B.Mean(ms)", 10), ("B.Std(ms)", 10), ("B.TO", 5), ("Nodes(B)", 10),
+        ("Build(ms)", 10), ("L.Mean(ms)", 10), ("L.Std(ms)", 10), ("L.TO", 5), ("Nodes(L)", 10),
+        ("Speedup", 15), ("Sanity", 8)
     ]
     fmt = "  ".join([f"{{:<{w}}}" for _, w in HEADERS])
     with open(filename, "w") as f:
@@ -350,15 +400,13 @@ def init_results_file(filename):
 def append_result_row(filename, r):
     HEADERS = [
         ("Motif", 10), ("Nodes", 8), ("Density", 7), ("Hops", 5),
-        ("B.Mean(ms)", 10), ("B.Std(ms)", 10), ("B.TO", 5), ("Paths(B)", 10),
-        ("Build(ms)", 10), ("L.Mean(ms)", 10), ("L.Std(ms)", 10), ("L.TO", 5), ("Paths(L)", 10),
-        ("Speedup", 8), ("Sanity", 8)
+        ("B.Mean(ms)", 10), ("B.Std(ms)", 10), ("B.TO", 5), ("Nodes(B)", 10),
+        ("Build(ms)", 10), ("L.Mean(ms)", 10), ("L.Std(ms)", 10), ("L.TO", 5), ("Nodes(L)", 10),
+        ("Speedup", 15), ("Sanity", 8)
     ]
     fmt = "  ".join([f"{{:<{w}}}" for _, w in HEADERS])
-    
     s_val = r["speedup"]
-    s_str = f"{s_val:.2f}" if isinstance(s_val, float) else str(s_val)
-
+    s_str = s_val if isinstance(s_val, str) else f"{s_val:.2f}"
     line = fmt.format(
         r["motif"], r["nodes"], r["density"], str(r["hops"]),
         f"{r['base_mean']:.2f}", f"{r['base_std']:.2f}", r['base_timeouts'], f"{r['base_paths']:.1f}",
@@ -371,16 +419,14 @@ def append_result_row(filename, r):
 
 def main():
     global DEBUG
-    
-    parser = argparse.ArgumentParser(description="Motif Scaling with Variable Hops")
+    parser = argparse.ArgumentParser(description="Motif Scaling (Iterative Leveled)")
     parser.add_argument("--uri", default="bolt://127.0.0.1:7687")
     parser.add_argument("--user", default="neo4j")
     parser.add_argument("--password", required=True)
     parser.add_argument("--database", default="neo4j")
     parser.add_argument("--densities", type=float, nargs="+", default=[1.0, 5.0, 10.0])
     parser.add_argument("--nodes", type=int, nargs="+", default=[10000])
-    parser.add_argument("--hops", type=int, nargs="+", default=[2,4,8,16,32,64])
-    parser.add_argument("--test_mode", choices=["zigzag", "wildcard"], default="zigzag")
+    parser.add_argument("--hops", type=int, nargs="+", default=[2,4,8,16,32,64,128,256,512,1024])
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--gmark_dir", default="../gmark")
@@ -394,8 +440,7 @@ def main():
     
     out_dir = os.path.dirname(args.out)
     if out_dir: Path(out_dir).mkdir(parents=True, exist_ok=True)
-    
-    final_output_file = f"{args.out}_{args.test_mode}_{timestamp}.txt"
+    final_output_file = f"{args.out}_zigzag_{timestamp}.txt"
     print(f"Output: {final_output_file}")
     init_results_file(final_output_file)
 
@@ -405,15 +450,10 @@ def main():
         print(f"Connection failed: {e}"); sys.exit(1)
 
     motifs_to_test = []
-    if args.test_mode == "zigzag":
-        base = ['U', 'D']
-        for k in [2, 3, 4, 5]:
-            m = (base * 3)[:k]
-            motifs_to_test.append("".join(m))
-    elif args.test_mode == "wildcard":
-        # motifs_to_test = ["UDU", "U*U", "*D*"]
-        motifs_to_test = ["*D*"]
-
+    base = ['U', 'D']
+    for k in [2, 3, 4, 5]:
+        m = (base * 3)[:k]
+        motifs_to_test.append("".join(m))
 
     for N in args.nodes:
         print(f"\n=== PROCESSING NODE COUNT: {N} ===")
@@ -423,137 +463,151 @@ def main():
 
             for motif in motifs_to_test:
                 print(f"\n>>> Testing Motif: {motif} (Len: {len(motif)})")
-                
                 configs = list(args.hops) + ["inf"]
                 experiment_data = {
                     h: {
                         "base": [], "lift": [], "build": [], 
                         "base_counts": [], "lift_counts": [], 
-                        "base_to": 0, "lift_to": 0,
+                        "base_to": 0, "lift_to": 0, "build_to": 0,
                         "sanity_mismatch": False, "sanity_verified_count": 0
                     } for h in configs
                 }
-
                 for r in range(args.repeats):
                     debug_print(f"\n[DEBUG] --- Run {r+1}/{args.repeats} ---")
                     tmp_dir = f"/tmp/exp_run_{r}"
                     csv_path = generate_gmark_csv(N, E, args.gmark_dir, tmp_dir)
-                    
                     try:
                         driver = GraphDatabase.driver(args.uri, auth=auth)
                         with driver.session(database=args.database) as session:
-                            # PASSING ARGS.TIMEOUT
-                            _, lift_ms = build_infrastructure(session, csv_path, motif, args.timeout)
-                        
-                        # Handle Lift Timeout: If -1, we mark as timeout and skip lift queries
-                        lift_failed = (lift_ms == -1)
+                            clear_database_full(session)
+                            for i, stmt in enumerate(INIT_CONSTRAINTS): run_write(session, stmt)
+                            load_base_graph(session, csv_path)
+                            res = session.run(GET_ALL_ACCOUNTS)
+                            all_ids = [rec["id"] for rec in res]
 
-                        consecutive_base_to = 0
-                        consecutive_lift_to = 0
+                            current_graph_state = None
+                            cached_global_build_ms = None
+                            consec_base_to = 0
+                            consec_lift_to = 0
 
-                        for H in configs:
-                            h_label = f"Unbounded" if H == "inf" else f"Hops={H}"
-                            
-                            # Only record build time if it succeeded
-                            if not lift_failed:
-                                experiment_data[H]["build"].append(lift_ms)
-                            else:
-                                experiment_data[H]["lift_to"] += 1
+                            for H in configs:
+                                h_label = f"Unbounded" if H == "inf" else f"Hops={H}"
+                                print(f"  > Config {h_label}...")
+                                is_iterative = (isinstance(H, int) and H <= 1024)
+                                required_state = "Iterative" if is_iterative else "Global"
+                                run_lift = (consec_lift_to < 2)
+                                run_base = (consec_base_to < 2)
+                                lift_ms = None; lifted_count = None; base_count = None; skipped_build = False
 
-                            q_base = generate_native_query(motif, str(H))
-                            q_lift = make_lifted_query_final(len(motif), str(H))
+                                if run_lift:
+                                    if required_state == "Global" and current_graph_state == "Global":
+                                        print(f"    [Build] REUSING existing Global Graph.")
+                                        lift_ms = cached_global_build_ms
+                                        skipped_build = True
+                                    else:
+                                        clean_lifted_graph(session)
+                                        t_start = time.perf_counter()
+                                        build_success = False
+                                        if is_iterative:
+                                            build_success = build_iterative_lifted_graph(session, all_ids, motif, H, args.timeout, t_start)
+                                            current_graph_state = None 
+                                        else:
+                                            build_success = build_full_lifted_graph(session, all_ids, motif, args.timeout, t_start)
+                                            if build_success: current_graph_state = "Global"
+                                        if build_success:
+                                            lift_ms = (time.perf_counter() - t_start) * 1000
+                                            if required_state == "Global": cached_global_build_ms = lift_ms
+                                        else: lift_ms = None 
 
-                            # --- BASE QUERY (ALWAYS RUN) ---
-                            val_b = -1
-                            if consecutive_base_to >= 2:
-                                experiment_data[H]["base_to"] += 1
-                            else:
-                                try:
-                                    val, t_sec = run_timed_query(args.uri, auth, q_base, args.timeout, args.database)
-                                    experiment_data[H]["base"].append(t_sec * 1000)
-                                    experiment_data[H]["base_counts"].append(val)
-                                    val_b = val
-                                    consecutive_base_to = 0 
-                                except TimeoutError:
-                                    experiment_data[H]["base_to"] += 1
-                                    consecutive_base_to += 1
-                            
-                            # --- LIFT QUERY (ONLY RUN IF BUILD SUCCEEDED) ---
-                            val_l = -1
-                            if lift_failed:
-                                # Counted as timeout/fail in experiment_data already or just skipped
-                                pass
-                            elif consecutive_lift_to >= 2:
-                                experiment_data[H]["lift_to"] += 1
-                            else:
-                                try:
-                                    val, t_sec = run_timed_query(args.uri, auth, q_lift, args.timeout, args.database)
-                                    experiment_data[H]["lift"].append(t_sec * 1000)
-                                    experiment_data[H]["lift_counts"].append(val)
-                                    val_l = val
-                                    consecutive_lift_to = 0 
-                                except TimeoutError:
-                                    experiment_data[H]["lift_to"] += 1
-                                    consecutive_lift_to += 1
+                                    if lift_ms is None:
+                                        print(f"    Build: TIMEOUT/FAIL")
+                                        experiment_data[H]["build_to"] += 1
+                                        consec_lift_to += 1
+                                    else:
+                                        prefix = "[Cached]" if skipped_build else "[New]"
+                                        print(f"    Build {prefix}: {lift_ms:.2f}ms")
+                                        experiment_data[H]["build"].append(lift_ms)
+                                        q_lift = make_lifted_query_final(len(motif), str(H))
+                                        try:
+                                            val, t_sec = run_timed_query(args.uri, auth, q_lift, args.timeout, args.database)
+                                            experiment_data[H]["lift"].append(t_sec * 1000)
+                                            experiment_data[H]["lift_counts"].append(val)
+                                            lifted_count = val
+                                            consec_lift_to = 0
+                                        except TimeoutError:
+                                            experiment_data[H]["lift_to"] += 1
+                                            consec_lift_to += 1
+                                        except Exception as e:
+                                            print(f"    Lift Query Error: {e}")
+                                            consec_lift_to += 1
+                                else: experiment_data[H]["lift_to"] += 1
 
-                            # Sanity only if both ran
-                            if val_b >= 0 and val_l >= 0:
-                                if val_b == val_l:
-                                    experiment_data[H]["sanity_verified_count"] += 1
-                                    print(f"    [Run {r+1}] {h_label}: Sanity PASS (Count: {val_b})")
-                                else:
-                                    experiment_data[H]["sanity_mismatch"] = True
-                                    print(f"    [Run {r+1}] {h_label}: Sanity FAIL (Base={val_b} vs Lift={val_l})")
-                            elif val_b < 0 or val_l < 0:
-                                print(f"    [Run {r+1}] {h_label}: Skip Sanity (Timeout/Skip)")
+                                if run_base:
+                                    q_base = generate_native_query(motif, str(H))
+                                    try:
+                                        val, t_sec = run_timed_query(args.uri, auth, q_base, args.timeout, args.database)
+                                        experiment_data[H]["base"].append(t_sec * 1000)
+                                        experiment_data[H]["base_counts"].append(val)
+                                        base_count = val
+                                        consec_base_to = 0
+                                    except TimeoutError:
+                                        experiment_data[H]["base_to"] += 1
+                                        consec_base_to += 1
+                                    except Exception as e:
+                                        print(f"    Base Query Error: {e}")
+                                        consec_base_to += 1
+                                else: experiment_data[H]["base_to"] += 1
 
-                    except Exception as e:
-                        print(f"Run Error: {e}")
+                                if base_count is not None and lifted_count is not None:
+                                    if base_count == lifted_count: experiment_data[H]["sanity_verified_count"] += 1
+                                    else:
+                                        experiment_data[H]["sanity_mismatch"] = True
+                                        print(f"    [SANITY] FAIL: Base={base_count} vs Lift={lifted_count}")
+
+                    except Exception as e: print(f"Run Error: {e}")
                     finally:
                         try: os.remove(csv_path)
                         except: pass
 
-
                 print(f"--- Summary for Motif={motif} ---")
+                last_speedup = 0.0
                 for H in configs:
                     data = experiment_data[H]
                     def get_stats(vals):
                         if not vals: return 0.0, 0.0
                         return statistics.mean(vals), statistics.stdev(vals) if len(vals)>1 else 0.0
-
                     b_mean, b_std = get_stats(data["base"])
                     l_mean, l_std = get_stats(data["lift"])
                     build_avg = statistics.mean(data["build"]) if data["build"] else 0.0
                     base_paths = statistics.mean(data["base_counts"]) if data["base_counts"] else 0.0
                     lift_paths = statistics.mean(data["lift_counts"]) if data["lift_counts"] else 0.0
-                    
-                    denom = build_avg + l_mean
-                    speedup = "x"
-                    base_failed = (data["base_to"] == args.repeats)
-                    lift_failed = (data["lift_to"] == args.repeats)
-                    
-                    # Logic: If all lifts failed (timeouts or build fails)
-                    if base_failed and lift_failed: 
-                        speedup = "x"
-                    elif base_failed: 
-                        speedup = float('inf')
-                    elif denom > 0: 
-                        speedup = b_mean / denom
-                    else: 
-                        speedup = 0.0
+                    lift_failures = data["lift_to"] + data["build_to"]
+                    lift_failed = (len(data["lift"]) == 0 and lift_failures > 0)
+                    base_failed = (len(data["base"]) == 0 and data["base_to"] > 0)
+                    was_attempted = (len(data["base"]) > 0 or data["base_to"] > 0 or len(data["lift"]) > 0 or lift_failures > 0)
 
+                    if was_attempted:
+                        denom = build_avg + l_mean
+                        if base_failed and lift_failed: speedup = "Both Time Out"
+                        elif lift_failed: speedup = "0.00"
+                        elif base_failed and denom > 0: speedup = float('inf')
+                        elif denom > 0: speedup = b_mean / denom
+                        else: speedup = 0.0
+                        last_speedup = speedup
+                    else: speedup = last_speedup
                     sanity = "FAIL" if data["sanity_mismatch"] else ("PASS" if data["sanity_verified_count"] > 0 else "N/A")
-
                     row = {
                         "motif": motif, "nodes": N, "density": D, "hops": H,
                         "base_mean": b_mean, "base_std": b_std, "base_timeouts": data["base_to"], 
                         "base_paths": base_paths,
                         "build_avg": build_avg,
-                        "lift_mean": l_mean, "lift_std": l_std, "lift_timeouts": data["lift_to"],
+                        "lift_mean": l_mean, "lift_std": l_std, "lift_timeouts": lift_failures,
                         "lift_paths": lift_paths,
                         "speedup": speedup, "sanity": sanity
                     }
                     append_result_row(final_output_file, row)
+
+    print(f"\nDone. Results: {final_output_file}")
 
 if __name__ == "__main__":
     multiprocessing.set_start_method("spawn", force=True)
