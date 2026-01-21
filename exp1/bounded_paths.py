@@ -14,7 +14,7 @@ from pathlib import Path
 from neo4j import GraphDatabase
 from neo4j.exceptions import Neo4jError
 
-# python3 ./bounded_paths.py --password "ItayBachar88" --nodes 100 1000 10000 100000 1000000 
+# python3 ./bounded_paths.py --password "ItayBachar88"
 # -----------------------------------------------------------------------------
 # Configuration Constants
 # -----------------------------------------------------------------------------
@@ -219,7 +219,7 @@ def load_graph_to_neo4j(session, csv_path):
         batch = edges[i:i + LOAD_BATCH_SIZE]
         run_write(session, LOAD_EDGES, {"rows": batch}, desc=f"LOAD_EDGES_BATCH_{i}")
 
-def build_infrastructure(session, csv_path):
+def build_infrastructure(session, csv_path, timeout=None):
     print("\n[DEBUG] --- STARTING INFRASTRUCTURE BUILD ---")
     
     # 1. Clear Database (Batched)
@@ -237,7 +237,7 @@ def build_infrastructure(session, csv_path):
 
     # 4. Lifted Graph Build (Batched)
     print("\n[DEBUG] --- STARTING LIFTED GRAPH GENERATION ---")
-    t_start = time.perf_counter()
+    t_lift_start = time.perf_counter()
     
     result = session.run(GET_ALL_ACCOUNTS)
     all_ids = [record["id"] for record in result]
@@ -247,6 +247,11 @@ def build_infrastructure(session, csv_path):
     # Build Stage Nodes
     print(f"[DEBUG] Building Stage Nodes in batches of {LIFT_BATCH_SIZE}...")
     for i in range(0, total_ids, LIFT_BATCH_SIZE):
+        # Timeout Check
+        if timeout and (time.perf_counter() - t_lift_start > timeout):
+            print(f"[DEBUG] Build Timed Out during Node generation after {time.perf_counter() - t_lift_start:.2f}s")
+            return base_ms, None
+
         batch_ids = all_ids[i:i + LIFT_BATCH_SIZE]
         run_write(session, BUILD_STAGE_NODES_BATCH, {"batchIds": batch_ids}, desc=f"LIFT_NODES_{i}")
         if i % (LIFT_BATCH_SIZE * 5) == 0:
@@ -255,12 +260,17 @@ def build_infrastructure(session, csv_path):
     # Build Stage Edges
     print(f"[DEBUG] Building Stage Edges in batches of {LIFT_BATCH_SIZE}...")
     for i in range(0, total_ids, LIFT_BATCH_SIZE):
+        # Timeout Check
+        if timeout and (time.perf_counter() - t_lift_start > timeout):
+            print(f"[DEBUG] Build Timed Out during Edge generation after {time.perf_counter() - t_lift_start:.2f}s")
+            return base_ms, None
+
         batch_ids = all_ids[i:i + LIFT_BATCH_SIZE]
         run_write(session, BUILD_STAGE_EDGES_BATCH, {"batchIds": batch_ids}, desc=f"LIFT_EDGES_{i}")
         if i % (LIFT_BATCH_SIZE * 5) == 0:
             print(f"  [DEBUG] Progress: {i}/{total_ids} source nodes processed...")
     
-    lift_ms = (time.perf_counter() - t_start) * 1000
+    lift_ms = (time.perf_counter() - t_lift_start) * 1000
     print(f"[DEBUG] Lifted Graph Build Complete. Time: {lift_ms:.2f}ms")
 
     return base_ms, lift_ms
@@ -304,7 +314,7 @@ def init_results_file(filename):
         ("Nodes", 8), ("Density", 7), ("Edges", 9), ("Hops", 5),
         ("B.Mean(ms)", 10), ("B.Std(ms)", 10), ("B.TO", 5),
         ("Build(ms)", 10), ("L.Mean(ms)", 10), ("L.Std(ms)", 10), ("L.TO", 5),
-        ("Speedup", 8), ("Sanity", 8)
+        ("Speedup", 15), ("Sanity", 8)
     ]
     fmt = "  ".join([f"{{:<{w}}}" for _, w in HEADERS])
     title_row = fmt.format(*[h[0] for h in HEADERS])
@@ -318,15 +328,23 @@ def append_result_row(filename, r):
         ("Nodes", 8), ("Density", 7), ("Edges", 9), ("Hops", 5),
         ("B.Mean(ms)", 10), ("B.Std(ms)", 10), ("B.TO", 5),
         ("Build(ms)", 10), ("L.Mean(ms)", 10), ("L.Std(ms)", 10), ("L.TO", 5),
-        ("Speedup", 8), ("Sanity", 8)
+        ("Speedup", 15), ("Sanity", 8)
     ]
     fmt = "  ".join([f"{{:<{w}}}" for _, w in HEADERS])
+    
+    # Handle Speedup formatting (string "x" vs float)
+    speedup_val = r["speedup"]
+    if isinstance(speedup_val, str):
+        speedup_str = speedup_val
+    else:
+        speedup_str = f"{speedup_val:.2f}"
+    
     line = fmt.format(
         r["nodes"], r["density"], r["edges"], r["hops"],
         f"{r['base_mean']:.2f}", f"{r['base_std']:.2f}", r['base_timeouts'],
         f"{r['build_avg']:.2f}",
         f"{r['lift_mean']:.2f}", f"{r['lift_std']:.2f}", r['lift_timeouts'],
-        f"{r['speedup']:.2f}",
+        speedup_str,
         r["sanity"]
     )
     with open(filename, "a") as f:
@@ -337,10 +355,10 @@ def main():
     parser.add_argument("--uri", default="bolt://127.0.0.1:7687")
     parser.add_argument("--user", default="neo4j")
     parser.add_argument("--password", required=True)
-    parser.add_argument("--database", default="neo4j2", help="Name of the database")
+    parser.add_argument("--database", default="neo4j", help="Name of the database")
     parser.add_argument("--densities", type=float, nargs="+", default=[1.0, 5.0, 10.0])
     parser.add_argument("--hops", type=int, nargs="+", default=[2,4,8,16])
-    parser.add_argument("--nodes", type=int, nargs="+", default=[1000])
+    parser.add_argument("--nodes", type=int, nargs="+", default=[100, 1000, 10000, 100000, 1000000])
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--gmark_dir", default="../gmark")
@@ -378,7 +396,7 @@ def main():
             experiment_data = {
                 h: {
                     "base": [], "lift": [], "build": [], 
-                    "base_to": 0, "lift_to": 0,
+                    "base_to": 0, "lift_to": 0, "build_to": 0,
                     "sanity_mismatch": False, 
                     "sanity_verified_count": 0
                 } 
@@ -391,15 +409,22 @@ def main():
                 csv_path = generate_gmark_csv(N, E, args.gmark_dir, tmp_dir)
                 
                 try:
-                    # 1. Build Infrastructure ONCE for this repeat
+                    # 1. Build Infrastructure with TIMEOUT check
                     with driver.session(database=args.database) as session:
-                        _, lift_ms = build_infrastructure(session, csv_path)
+                        _, lift_ms = build_infrastructure(session, csv_path, timeout=args.timeout)
                     
+                    lift_build_failed = (lift_ms is None)
+                    if lift_build_failed:
+                        print(f"    [WARN] Leveled Build Timed Out (> {args.timeout}s). Skipping Lifted Queries.")
+
                     # 2. Test ALL hops on this same infrastructure
                     for H in args.hops:
                         print(f"  > Testing Hops={H} (on existing graph)...")
                         
-                        experiment_data[H]["build"].append(lift_ms)
+                        if lift_build_failed:
+                            experiment_data[H]["build_to"] += 1
+                        else:
+                            experiment_data[H]["build"].append(lift_ms)
 
                         base_count = None
                         lifted_count = None
@@ -416,17 +441,20 @@ def main():
                         except Exception as e:
                             print(f"    Baseline Error: {e}")
 
-                        # Lifted
-                        try:
-                            val, t_sec = run_timed_query(args.uri, auth, make_lifted_query(H), args.timeout, args.database)
-                            experiment_data[H]["lift"].append(t_sec * 1000)
-                            lifted_count = val
-                            print(f"    Lifted:   {t_sec*1000:.2f}ms | Count: {lifted_count}")
-                        except TimeoutError:
-                            print(f"    Lifted:   TIMEOUT")
-                            experiment_data[H]["lift_to"] += 1
-                        except Exception as e:
-                            print(f"    Lifted Error: {e}")
+                        # Lifted (Only if build succeeded)
+                        if lift_build_failed:
+                            print(f"    Lifted:   SKIPPING (Build Timeout)")
+                        else:
+                            try:
+                                val, t_sec = run_timed_query(args.uri, auth, make_lifted_query(H), args.timeout, args.database)
+                                experiment_data[H]["lift"].append(t_sec * 1000)
+                                lifted_count = val
+                                print(f"    Lifted:   {t_sec*1000:.2f}ms | Count: {lifted_count}")
+                            except TimeoutError:
+                                print(f"    Lifted:   TIMEOUT")
+                                experiment_data[H]["lift_to"] += 1
+                            except Exception as e:
+                                print(f"    Lifted Error: {e}")
 
                         # Sanity Check
                         if base_count is not None and lifted_count is not None:
@@ -437,7 +465,7 @@ def main():
                                 print(f"    [SANITY] FAIL! Base={base_count} vs Lifted={lifted_count}")
                                 experiment_data[H]["sanity_mismatch"] = True
                         else:
-                            print(f"    [SANITY] N/A (Timeout occurred)")
+                            print(f"    [SANITY] N/A (Timeout or Skip)")
 
                 except Exception as e:
                     print(f"\n[CRITICAL ERROR] Run failed: {e}")
@@ -460,16 +488,23 @@ def main():
                 l_mean, l_std = get_stats(data["lift"])
                 build_avg = statistics.mean(data["build"]) if data["build"] else 0.0
                 
+                # Check for Timeout/Failure conditions
+                # Lift is considered failed if it timed out in Query OR Build
+                total_lift_failures = data["lift_to"] + data["build_to"]
+                lift_failed = (len(data["lift"]) == 0 and total_lift_failures > 0)
+                
+                base_failed = (len(data["base"]) == 0 and data["base_to"] > 0)
+
                 denominator = build_avg + l_mean
                 
-                # --- Speedup Calculation Logic (with Infinity) ---
-                # Case 1: Baseline totally timed out (empty list, timeouts > 0) AND Lifted succeeded (denominator > 0)
-                if len(data["base"]) == 0 and data["base_to"] > 0 and denominator > 0:
+                if base_failed and lift_failed:
+                    speedup = "Both Time Out"
+                elif lift_failed and not base_failed:
+                    speedup = "0.00"
+                elif base_failed and denominator > 0:
                     speedup = float('inf')
-                # Case 2: Standard calculation
                 elif denominator > 0:
                     speedup = b_mean / denominator
-                # Case 3: Both failed or Lifted failed
                 else:
                     speedup = 0.0
 
@@ -481,16 +516,22 @@ def main():
                 else:
                     sanity_str = "N/A"
 
+                # Handle formatting for print
+                if isinstance(speedup, str):
+                    speedup_str = speedup
+                else:
+                    speedup_str = f"{speedup:.2f}x"
+
                 row = {
                     "nodes": N, "density": D, "edges": E, "hops": H,
                     "base_mean": b_mean, "base_std": b_std, "base_timeouts": data["base_to"],
                     "build_avg": build_avg,
-                    "lift_mean": l_mean, "lift_std": l_std, "lift_timeouts": data["lift_to"],
+                    "lift_mean": l_mean, "lift_std": l_std, "lift_timeouts": total_lift_failures,
                     "speedup": speedup,
                     "sanity": sanity_str
                 }
                 append_result_row(final_output_file, row)
-                print(f"  Hops={H} | Base={b_mean:.2f}ms | Lift={l_mean:.2f}ms | Speedup={speedup:.2f}x | Sanity={sanity_str}")
+                print(f"  Hops={H} | Base={b_mean:.2f}ms | Lift={l_mean:.2f}ms | Speedup={speedup_str} | Sanity={sanity_str}")
 
             driver.close()
 
