@@ -9,7 +9,8 @@ We evaluate compiling order-aware path constraints into plain **reachability** u
 - `exp1/bounded_paths.py` — Exp 1 (bounded increasing paths)
 - `exp2/unbounded_paths.py` — Exp 2 (unbounded increasing paths)
 - `exp3/peak_paths.py` — Exp 3 (peak motif)
-- `exp4/motif_scaling.py` — Exp 4 (scaling with motif length / wildcards)
+- `exp4/motif_scaling.py` — Exp 4 (scaling with motif length)
+- `Bitcoin_Alpha` and `Bitcoin_OTC` — Real Data Exp (scaling with motif length)
 
 ## Requirements
 - Neo4j reachable via Bolt
