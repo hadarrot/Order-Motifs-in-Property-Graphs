@@ -14,7 +14,7 @@ from pathlib import Path
 from neo4j import GraphDatabase
 from neo4j.exceptions import Neo4jError
 
-# python3 motif_scaling_with_leveled.py --password "ItayBachar88"
+# python3 motif_scaling_with_leveled.py --password XXXX
 
 # -----------------------------------------------------------------------------
 # Global Debug Control
