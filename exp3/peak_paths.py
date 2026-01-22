@@ -14,7 +14,7 @@ from pathlib import Path
 from neo4j import GraphDatabase
 from neo4j.exceptions import Neo4jError
 
-# python3 ./peak_paths.py --password "ItayBachar88" --debug
+# python3 ./peak_paths.py --password XXXX --debug
 # -----------------------------------------------------------------------------
 # Global Debug Control
 # -----------------------------------------------------------------------------
