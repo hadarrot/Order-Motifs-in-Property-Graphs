@@ -15,7 +15,7 @@ from neo4j import GraphDatabase
 from neo4j.exceptions import Neo4jError
 
 # Example Usage:
-# python3 ./unbounded_paths.py --password "ItayBachar88" --nodes 100 1000 10000 100000 1000000
+# python3 ./unbounded_paths.py --password XXXX --nodes 100 1000 10000 100000 1000000
 # -----------------------------------------------------------------------------
 # Configuration Constants
 # -----------------------------------------------------------------------------
