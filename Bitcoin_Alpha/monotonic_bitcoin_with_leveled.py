@@ -20,7 +20,7 @@ from neo4j.exceptions import Neo4jError
 # Configuration Constants
 # -----------------------------------------------------------------------------
 
-# python3 ./monotonic_bitcoin_with_leveled.py --password "ItayBachar88"
+# python3 ./monotonic_bitcoin_with_leveled.py --password XXXX
 
 BITCOIN_ALPHA_URL = "https://snap.stanford.edu/data/soc-sign-bitcoinalpha.csv.gz"
 
