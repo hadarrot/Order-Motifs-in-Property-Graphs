@@ -97,7 +97,7 @@ from matplotlib.lines import Line2D
 
 # --- 1. Data Loading ---
 
-# DATASET A: Unbounded (From your latest prompt)
+# DATASET A: Unbounded
 data_unbounded_str = """Nodes Density Edges B.Mean(ms) B.Std(ms) B.TO Build(ms) L.Mean(ms) L.Std(ms) L.TO Speedup
 100 1.0 100 104.22 89.52 0 71.67 11.30 13.83 0 1.26
 100 5.0 500 0.00 0.00 3 63.96 46.49 33.14 0 inf
@@ -116,7 +116,7 @@ data_unbounded_str = """Nodes Density Edges B.Mean(ms) B.Std(ms) B.TO Build(ms) 
 1000000 10.0 10000000 0.00 0.00 3 916501.40 0.00 0.00 3 TO
 """
 
-# DATASET B: Bounded (From previous turn)
+# DATASET B: Bounded
 data_bounded_str = """Nodes Density Edges Hops B.Mean(ms) B.Std(ms) B.TO Build(ms) L.Mean(ms) L.Std(ms) L.TO Speedup
 100 1.0 100 2 8.03 2.75 0 51.14 7.21 2.78 0 0.14
 100 1.0 100 4 17.25 10.57 0 51.14 14.11 18.14 0 0.26
@@ -223,7 +223,6 @@ df_bounded.rename(columns=col_map, inplace=True)
 # --- 2. Configuration & Logic ---
 TIMEOUT_THRESHOLD = 60000  # 60s in ms
 TIMEOUT_VAL = 2 * 10**7    # Visual ceiling value for plotting
-TIMEOUT_COLOR = 'gray'
 
 sns.set_theme(style="whitegrid", context="paper", font_scale=1.2)
 plt.rcParams['font.family'] = 'serif'
@@ -252,9 +251,6 @@ def calculate_plot_latencies(df_in):
         if row['L.TO'] > 0:
             return TIMEOUT_VAL
 
-        # NOTE: Some data points have L.Mean=0.00 but L.TO=0 (very fast).
-        # Only treat 0.00 as timeout if L.TO > 0 (handled above).
-
         # Calculate Total Cost = Build Time + Query Time
         total_time = row['Build'] + row['L.Mean']
 
@@ -279,34 +275,34 @@ def plot_split_series(sub_df, x_col, y_col, color, style, marker_size):
     xs = sub_df[x_col].values
     ys = sub_df[y_col].values
 
+    # 1. Line Loop
     for i in range(len(xs) - 1):
         x1, y1 = xs[i], ys[i]
         x2, y2 = xs[i+1], ys[i+1]
 
-        # Draw line segment
-        if y2 == TIMEOUT_VAL and y1 < TIMEOUT_VAL:
-            # Transition to Timeout -> Grey line rising
-            plt.plot([x1, x2], [y1, y2], color=TIMEOUT_COLOR, linestyle=style,
-                     linewidth=1.5, zorder=1)
-        elif y1 == TIMEOUT_VAL and y2 == TIMEOUT_VAL:
-            # Both are timeout -> Don't draw line on ceiling (cleaner look)
-            pass
-        elif y1 == TIMEOUT_VAL and y2 < TIMEOUT_VAL:
-             # Coming back from timeout (unlikely in scalability, but possible)
-             plt.plot([x1, x2], [y1, y2], color=TIMEOUT_COLOR, linestyle=style,
-                     linewidth=1.5, zorder=1)
-        else:
-            # Standard valid segment -> Color line
+        # Case A: Both valid -> Normal colored line
+        if y1 < TIMEOUT_VAL and y2 < TIMEOUT_VAL:
             plt.plot([x1, x2], [y1, y2], color=color, linestyle=style,
-                     linewidth=2, marker='o', markersize=marker_size, zorder=3)
+                     linewidth=2, zorder=3)
 
-    # Ensure markers are plotted
-    for i in range(len(xs)):
-        if ys[i] == TIMEOUT_VAL:
-             # Optional: Draw a small grey dot on the ceiling
-             plt.plot(xs[i], ys[i], color=TIMEOUT_COLOR, marker='.', zorder=2)
-        else:
-             pass # Logic above handles markers for valid lines usually
+        # Case B: Transition from Valid to Timeout -> Gray connecting line
+        elif y1 < TIMEOUT_VAL and y2 >= TIMEOUT_VAL:
+            plt.plot([x1, x2], [y1, y2], color='gray', linestyle=style,
+                     linewidth=1.5, zorder=2)
+
+            # Draw the 'x' marker at the end of this connection
+            plt.plot(x2, y2, linestyle='None', marker='x',
+                     markersize=marker_size, color='gray', markeredgewidth=2, zorder=3)
+
+    # 2. Valid Markers (Circles)
+    valid_mask = ys < TIMEOUT_VAL
+    if np.any(valid_mask):
+        plt.plot(xs[valid_mask], ys[valid_mask], linestyle='None', marker='o',
+                 markersize=marker_size, color=color, zorder=3)
+
+    # Note: I deliberately do NOT iterate through all 'to_mask' to plot 'x's.
+    # 'x's are only plotted in Case B (above) when they are connected to a valid point.
+    # This prevents "floating" x markers for series that start as timeouts.
 
 def create_latency_plot(dataframe, title_suffix, filename):
     plt.figure(figsize=(7, 5))
@@ -344,6 +340,8 @@ def create_latency_plot(dataframe, title_suffix, filename):
     # Y-Axis Ticks & Labels
     plt.ylim(bottom=10, top=TIMEOUT_VAL * 2.5)
     current_ticks = list(plt.yticks()[0])
+
+    # Filter ticks to avoid clutter near T.O. line
     filtered_ticks = [t for t in current_ticks if t < TIMEOUT_VAL / 10]
     filtered_ticks.append(TIMEOUT_VAL)
     ax.set_yticks(filtered_ticks)
@@ -361,7 +359,6 @@ def create_latency_plot(dataframe, title_suffix, filename):
     plt.show()
 
 # --- 4. Execution ---
-
 
 # 2. Length = 2 Plot
 df_len2 = df_bounded[df_bounded['Hops'] == 2].copy()
